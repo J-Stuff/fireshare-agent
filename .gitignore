@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build / packaging output
+build/
+dist/
+*.spec
+!packaging/*.spec
+
+# Editors / IDEs
+.vscode/
+.idea/
+
+# OS-generated
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Local secrets / env files, if ever added
+.env
+.env.*
+
+# Local app data if ever generated inside the repo during dev
+*.db
+*.log
+/config.json

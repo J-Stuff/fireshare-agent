@@ -1,0 +1,7 @@
+pystray>=0.19.5
+customtkinter>=5.2.2
+watchdog>=4.0.1
+requests>=2.32.0
+keyring>=25.2.1
+pywin32>=306
+Pillow>=10.4.0
