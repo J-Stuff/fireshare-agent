@@ -18,10 +18,17 @@ _DEBOUNCE_SECONDS = 2.0
 
 
 class _DebouncedHandler(FileSystemEventHandler):
-    def __init__(self, allowed_extensions: set[str], is_paused: Callable[[], bool], on_candidate: Callable[[str], None]) -> None:
+    def __init__(
+        self,
+        allowed_extensions: set[str],
+        is_paused: Callable[[], bool],
+        on_candidate: Callable[[str], None],
+        excluded_dir_name: str | None = None,
+    ) -> None:
         self._allowed_extensions = allowed_extensions
         self._is_paused = is_paused
         self._on_candidate = on_candidate
+        self._excluded_dir_name = excluded_dir_name.lower() if excluded_dir_name else None
         self._timers: dict[str, threading.Timer] = {}
         self._lock = threading.Lock()
 
@@ -38,6 +45,11 @@ class _DebouncedHandler(FileSystemEventHandler):
             return
         if Path(path).suffix.lower() not in self._allowed_extensions:
             return
+        # Ignore the post-upload destination subfolder (at any depth) - a file just moved there
+        # after a successful upload would otherwise be picked straight back up as a "new" file.
+        if self._excluded_dir_name is not None:
+            if any(part.lower() == self._excluded_dir_name for part in Path(path).parent.parts):
+                return
 
         with self._lock:
             existing = self._timers.get(path)
@@ -70,6 +82,7 @@ class FolderWatcherService:
         video_extensions: list[str],
         image_extensions: list[str],
         on_candidate: Callable[[str], None],
+        excluded_dir_name: str | None = None,
     ) -> None:
         self.stop()
 
@@ -91,7 +104,7 @@ class FolderWatcherService:
             if not allowed:
                 continue
 
-            handler = _DebouncedHandler(allowed, lambda: self._paused, on_candidate)
+            handler = _DebouncedHandler(allowed, lambda: self._paused, on_candidate, excluded_dir_name)
             observer.schedule(handler, folder.path, recursive=folder.recursive)
             scheduled_any = True
 

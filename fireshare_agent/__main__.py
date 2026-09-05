@@ -30,10 +30,30 @@ def _configure_logging() -> None:
 def main() -> None:
     _configure_logging()
     # Imported after logging is configured so any import-time log calls land in the file too.
+    from fireshare_agent import single_instance
+
+    if not single_instance.acquire():
+        logging.getLogger(__name__).warning("Another instance of Fireshare Agent is already running - exiting.")
+        _notify_already_running()
+        return
+
     from fireshare_agent.app import FireshareAgentApp
 
     app = FireshareAgentApp()
     app.run()
+
+
+def _notify_already_running() -> None:
+    import tkinter as tk
+    import tkinter.messagebox as messagebox
+
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo("Fireshare Agent", "Fireshare Agent is already running - check your system tray.")
+        root.destroy()
+    except Exception:
+        pass  # best-effort notice only; exiting quietly is still the right outcome either way
 
 
 if __name__ == "__main__":
