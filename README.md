@@ -26,13 +26,16 @@ instance.
   it.
 - Your Fireshare password is stored in Windows Credential Manager, never in the config file.
 - Checks GitHub Releases for a newer version on startup (configurable) and lets you update from
-  the tray menu with one click - it downloads the new build, verifies its checksum, and relaunches
-  itself automatically. Only active in the packaged build; a no-op when running from source.
+  the tray menu with one click - after you confirm, it downloads the new installer, verifies its
+  checksum, and runs it silently (matching whether the app was originally installed per-machine or
+  per-user), which closes the app, replaces its files, and relaunches it automatically. Only
+  active in the packaged build; a no-op when running from source.
 
 ## Requirements
 
 - Windows 10/11
 - Python 3.11+ (only if running/building from source - the packaged build has no prerequisites)
+- [Inno Setup](https://jrsoftware.org/isinfo.php) 6.1+ (only if building the installer)
 
 ## Running from source
 
@@ -50,10 +53,24 @@ manifest at `%AppData%\FireshareAgent\manifest.db`, and logs at
 
 ```powershell
 .\.venv\Scripts\python.exe -m PyInstaller packaging\fireshare_agent.spec --noconfirm
+iscc /DMyAppVersion=1.2.3 packaging\installer.iss
 ```
 
-Produces a self-contained folder at `dist\FireshareAgent\` (onedir build - no Python install
-required on the target machine). Run `dist\FireshareAgent\FireshareAgent.exe`.
+The PyInstaller step produces a self-contained folder at `dist\FireshareAgent\` (onedir build - no
+Python install required on the target machine); the `iscc` step packages that folder into a single
+installer at `dist\installer\FireshareAgent-Setup-1.2.3.exe` (see
+[`packaging/installer.iss`](packaging/installer.iss)). `MyAppVersion` can be omitted for a local
+test compile - it defaults to `0.0.0-dev`.
+
+The installer ([Inno Setup](https://jrsoftware.org/isinfo.php)) supports both install modes from
+the same exe:
+
+- **Per-user** (default, no admin required) - installs under `%LocalAppData%\Programs`.
+- **Per-machine** (admin required) - installs under `Program Files`.
+
+Running it interactively shows a page letting the user pick; running it with `/CURRENTUSER` or
+`/ALLUSERS` on the command line (as the app's self-updater does, matching whichever mode is
+already installed) skips that prompt.
 
 ## Tests
 
@@ -86,8 +103,10 @@ Versioning and releases are fully automatic - there's no manual tagging step. On
 3. If a release was warranted, it bumps `fireshare_agent/__init__.py`'s `__version__` and
    `pyproject.toml`'s version, generates a changelog, tags it, and publishes a GitHub Release.
 4. The `build` job then checks out that new tag, builds the Windows executable on a
-   `windows-latest` runner, and attaches the zipped build plus a `.sha256` checksum file to the
-   release that was just published.
+   `windows-latest` runner, packages it into `FireshareAgent-Setup-<version>.exe` with Inno Setup,
+   and attaches that installer plus a `.sha256` checksum file to the release that was just
+   published. This is the same installer the in-app updater downloads and runs silently, so a
+   release isn't usable for auto-update until this job finishes.
 
 **Breaking changes while the version is still `0.x`**: `pyproject.toml` doesn't override
 `major_on_zero`, so it's at PSR's default of `true` - a single breaking-change commit (`feat!:`,
@@ -124,12 +143,16 @@ then bump minor instead while the major version is `0`.
   the same in-progress group on the server instead of abandoning the chunks already sent (which
   Fireshare only cleans up on a successful reassembly or a server restart, otherwise leaving them
   on disk indefinitely).
-- The self-updater downloads the new build's zip and, if the release published a `.sha256`
-  alongside it, verifies the checksum before touching anything - a mismatch aborts with an error
-  and the currently-installed files are left untouched. Since a running exe can't overwrite its
-  own files, applying an update hands off to a small generated PowerShell script that waits for
-  this process to exit, mirrors the new files over the install directory, relaunches the app, and
-  deletes itself.
+- The self-updater downloads the new release's installer and, if the release published a
+  `.sha256` alongside it, verifies the checksum before touching anything - a mismatch aborts with
+  an error and the currently-installed files are left untouched. Since a running exe can't
+  overwrite its own files, applying an update launches the downloaded installer with
+  `/VERYSILENT` and then quits - the installer closes the app (if it hasn't already exited),
+  replaces the installed files, and relaunches it. It's passed `/CURRENTUSER` or `/ALLUSERS`
+  depending on whether the app is currently installed per-user or per-machine, so it repeats that
+  same choice rather than prompting for it again on what's meant to be an unattended update - a
+  per-machine install still triggers a UAC prompt for the installer itself, since replacing files
+  under `Program Files` requires it, but no wizard UI appears.
 
 ## License
 

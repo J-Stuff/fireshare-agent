@@ -78,19 +78,22 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller packaging\fireshare_agent.spec --noconfirm
 
-      - name: Zip the build
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
         shell: pwsh
         run: |
-          $tag = "${{ needs.version.outputs.tag }}"
-          Compress-Archive -Path dist\FireshareAgent\* -DestinationPath "FireshareAgent-$tag-win64.zip"
+          $version = "${{ needs.version.outputs.version }}"
+          iscc "/DMyAppVersion=$version" packaging\installer.iss
 
       - name: Compute checksum
         shell: pwsh
         run: |
-          $tag = "${{ needs.version.outputs.tag }}"
-          $zipName = "FireshareAgent-$tag-win64.zip"
-          $hash = (Get-FileHash $zipName -Algorithm SHA256).Hash
-          "$hash  $zipName" | Out-File -Encoding ascii "$zipName.sha256"
+          $version = "${{ needs.version.outputs.version }}"
+          $exeName = "FireshareAgent-Setup-$version.exe"
+          $hash = (Get-FileHash "dist\installer\$exeName" -Algorithm SHA256).Hash
+          "$hash  $exeName" | Out-File -Encoding ascii "dist\installer\$exeName.sha256"
 
       - name: Upload release assets
         env:
@@ -98,4 +101,6 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ needs.version.outputs.tag }}"
-          gh release upload $tag "FireshareAgent-$tag-win64.zip" "FireshareAgent-$tag-win64.zip.sha256" --clobber --repo ${{ github.repository }}
+          $version = "${{ needs.version.outputs.version }}"
+          $exeName = "FireshareAgent-Setup-$version.exe"
+          gh release upload $tag "dist\installer\$exeName" "dist\installer\$exeName.sha256" --clobber --repo ${{ github.repository }}
