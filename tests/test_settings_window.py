@@ -8,6 +8,8 @@ Settings, then testing again. Fixed by persisting on test too.
 These tests touch the real Windows Credential Manager via `keyring` (there's no sandboxed
 alternative here), so the fixture snapshots and restores whatever was there before/after.
 """
+import threading
+
 import customtkinter as ctk
 import pytest
 
@@ -18,7 +20,9 @@ from fireshare_agent.config.app_config import (
     AppConfig,
 )
 from fireshare_agent.config.secrets import WEB_API_PASSWORD, delete_secret, get_secret, set_secret
-from fireshare_agent.ui.settings_window import SettingsWindow
+from fireshare_agent.models import ConnectionTestResult
+from fireshare_agent.ui import settings_window
+from fireshare_agent.ui.settings_window import SettingsWindow, _keep_password_only_if_confirmed
 from fireshare_agent.uploaders import cloudflare
 
 
@@ -209,3 +213,100 @@ def test_in_range_values_save_without_complaint(tk_root):
     finally:
         if window.winfo_exists():
             window.destroy()
+
+
+# --- A password is only kept once the server has confirmed it ---------------------------------
+#
+# Test Connection has to write the password to Credential Manager *before* the test, because the
+# MFA follow-up inside the login flow reads it back from there. The cost was that a typo stuck: the
+# user tests, sees "login failed", closes Settings without saving, and the background pipeline goes
+# on retrying with the wrong password - which is how an account gets locked out by its own uploader.
+
+
+def test_a_confirmed_password_is_kept(preserve_web_api_secret):
+    set_secret(WEB_API_PASSWORD, "newly-typed")
+
+    _keep_password_only_if_confirmed("the-old-one", confirmed=True)
+
+    assert get_secret(WEB_API_PASSWORD) == "newly-typed"
+
+
+def test_an_unconfirmed_password_is_rolled_back(preserve_web_api_secret):
+    set_secret(WEB_API_PASSWORD, "typo")
+
+    _keep_password_only_if_confirmed("the-old-one", confirmed=False)
+
+    assert get_secret(WEB_API_PASSWORD) == "the-old-one"
+
+
+def test_an_unconfirmed_password_with_no_previous_one_is_removed(preserve_web_api_secret):
+    """First-time setup: there was nothing stored before, so rolling back means storing nothing -
+    not leaving the failed attempt behind."""
+    set_secret(WEB_API_PASSWORD, "typo")
+
+    _keep_password_only_if_confirmed(None, confirmed=False)
+
+    assert get_secret(WEB_API_PASSWORD) is None
+
+
+def test_a_failed_test_connection_does_not_leave_the_typo_behind(tk_root, preserve_web_api_secret, monkeypatch):
+    """End to end through the button's own worker, so the rollback is pinned to the call site and
+    not just to the helper."""
+    set_secret(WEB_API_PASSWORD, "the-old-one")
+    window = SettingsWindow(tk_root, AppConfig(), on_save=lambda _c: None)
+    tk_root.update()
+    try:
+        window._webapi_password_entry.entry.delete(0, "end")
+        window._webapi_password_entry.entry.insert(0, "typo")
+
+        finished = threading.Event()
+        monkeypatch.setattr(window, "after", lambda delay, func: finished.set())
+
+        class _RejectingUploader:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def test_connection(self):
+                # The password really was persisted before the attempt - that part is deliberate,
+                # since the MFA follow-up reads it back from Credential Manager.
+                assert get_secret(WEB_API_PASSWORD) == "typo"
+                return ConnectionTestResult.fail("Invalid username or password.")
+
+        monkeypatch.setattr(settings_window, "WebApiUploader", _RejectingUploader)
+
+        window._test_web_api_connection()
+        assert finished.wait(timeout=10)
+
+        assert get_secret(WEB_API_PASSWORD) == "the-old-one"
+    finally:
+        window.destroy()
+
+
+def test_a_successful_test_connection_keeps_the_new_password(tk_root, preserve_web_api_secret, monkeypatch):
+    """The rollback must not undo the behaviour it is built around: a freshly typed password that
+    works has to stay usable immediately, without Save."""
+    set_secret(WEB_API_PASSWORD, "the-old-one")
+    window = SettingsWindow(tk_root, AppConfig(), on_save=lambda _c: None)
+    tk_root.update()
+    try:
+        window._webapi_password_entry.entry.delete(0, "end")
+        window._webapi_password_entry.entry.insert(0, "correct-horse")
+
+        finished = threading.Event()
+        monkeypatch.setattr(window, "after", lambda delay, func: finished.set())
+
+        class _AcceptingUploader:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def test_connection(self):
+                return ConnectionTestResult.ok("Logged in to Fireshare successfully.")
+
+        monkeypatch.setattr(settings_window, "WebApiUploader", _AcceptingUploader)
+
+        window._test_web_api_connection()
+        assert finished.wait(timeout=10)
+
+        assert get_secret(WEB_API_PASSWORD) == "correct-horse"
+    finally:
+        window.destroy()

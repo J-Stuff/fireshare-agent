@@ -7,13 +7,21 @@ Every other tray callback already handed off immediately.
 The fix runs the scan on a short-lived daemon thread. Marshalling it to the UI thread instead
 would not have helped: run_on_ui_thread() is root.after(), so the walk would have run inside Tk's
 event loop and frozen the settings and activity windows instead.
+
+Also covers the update-check response, reported by J: "Check for Updates Now" looked like it did
+nothing whenever an update was actually available.
 """
 import threading
 
 import pytest
 
 from fireshare_agent import app as app_module
-from fireshare_agent.app import FireshareAgentApp
+from fireshare_agent import updater
+from fireshare_agent.app import (
+    FireshareAgentApp,
+    UpdateCheckResponse,
+    decide_update_check_response,
+)
 from fireshare_agent.config.app_config import AppConfig
 
 
@@ -245,3 +253,116 @@ def test_a_scan_in_progress_bails_out_when_the_pipeline_is_stopped(tmp_path, rec
     pipeline.sync_now()
 
     assert enqueued == []
+
+
+# --- A manual update check owes the user a definite answer ------------------------------------
+#
+# Reported by J: "Check for Updates Now" appeared to do nothing when an update WAS available. The
+# two outcomes were handled asymmetrically - "no update" got a modal window, while "update
+# available" got only a tray balloon, and that balloon was gated on show_upload_notifications, the
+# per-upload notification toggle. Turning that off is entirely reasonable for a background
+# uploader, and it meant the interesting outcome produced no feedback of any kind.
+
+
+def test_manual_check_with_an_update_offers_to_install_it():
+    assert decide_update_check_response(
+        update_available=True, user_initiated=True, announce_automatic_updates=False,
+    ) is UpdateCheckResponse.OFFER_UPDATE
+
+
+def test_manual_check_with_an_update_is_not_gated_on_a_notification_setting():
+    """The heart of the report: the only reason the button looked broken was an unrelated toggle.
+    A user-initiated check answers regardless of every notification preference."""
+    for announce in (True, False):
+        assert decide_update_check_response(
+            update_available=True, user_initiated=True, announce_automatic_updates=announce,
+        ) is UpdateCheckResponse.OFFER_UPDATE
+
+
+def test_manual_check_with_no_update_says_so():
+    assert decide_update_check_response(
+        update_available=False, user_initiated=True, announce_automatic_updates=False,
+    ) is UpdateCheckResponse.ALREADY_CURRENT
+
+
+def test_automatic_check_with_an_update_stays_unobtrusive():
+    """A modal on launch would be an ambush, so the startup check keeps the balloon."""
+    assert decide_update_check_response(
+        update_available=True, user_initiated=False, announce_automatic_updates=True,
+    ) is UpdateCheckResponse.ANNOUNCE_UPDATE
+
+
+def test_automatic_check_with_no_update_says_nothing():
+    assert decide_update_check_response(
+        update_available=False, user_initiated=False, announce_automatic_updates=True,
+    ) is UpdateCheckResponse.NOTHING
+
+
+def test_automatic_check_stays_silent_when_update_announcements_are_off():
+    assert decide_update_check_response(
+        update_available=True, user_initiated=False, announce_automatic_updates=False,
+    ) is UpdateCheckResponse.NOTHING
+
+
+class _RecordingApp:
+    """Captures which branch _on_update_check_result dispatches into, without a real dialog."""
+
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+        self.tray = None
+        self._update_info = None
+        self.offered = 0
+        self.notifications: list[str] = []
+
+    def confirm_and_apply_update(self) -> None:
+        self.offered += 1
+
+    def _notify(self, message: str) -> None:
+        self.notifications.append(message)
+
+
+def _dispatch(info, notify_if_none: bool, config: AppConfig, monkeypatch) -> _RecordingApp:
+    instance = _RecordingApp(config)
+    shown = []
+    monkeypatch.setattr(app_module.messagebox, "showinfo", lambda *a, **k: shown.append(a))
+    FireshareAgentApp._on_update_check_result(instance, info, notify_if_none)
+    instance.info_dialogs = shown
+    return instance
+
+
+def test_the_dispatch_matches_the_decision_for_a_manual_check(monkeypatch):
+    """Pins the wiring as well as the decision function - the reported bug was in the dispatch."""
+    info = updater.UpdateInfo(
+        version="9.9.9", tag="v9.9.9", download_url="u", checksum_url="c", notes_url="n",
+    )
+    # show_upload_notifications off is exactly the configuration that used to produce silence.
+    config = AppConfig(show_upload_notifications=False, auto_check_for_updates=False)
+
+    instance = _dispatch(info, notify_if_none=True, config=config, monkeypatch=monkeypatch)
+
+    assert instance.offered == 1
+    assert instance.notifications == []
+    assert instance.info_dialogs == []
+
+
+def test_a_manual_check_with_no_update_still_shows_the_modal(monkeypatch):
+    config = AppConfig(show_upload_notifications=False, auto_check_for_updates=False)
+
+    instance = _dispatch(None, notify_if_none=True, config=config, monkeypatch=monkeypatch)
+
+    assert instance.offered == 0
+    assert len(instance.info_dialogs) == 1
+
+
+def test_an_automatic_check_never_opens_a_dialog(monkeypatch):
+    info = updater.UpdateInfo(
+        version="9.9.9", tag="v9.9.9", download_url="u", checksum_url="c", notes_url="n",
+    )
+    config = AppConfig(show_upload_notifications=False, auto_check_for_updates=True)
+
+    instance = _dispatch(info, notify_if_none=False, config=config, monkeypatch=monkeypatch)
+
+    assert instance.offered == 0
+    assert instance.info_dialogs == []
+    assert len(instance.notifications) == 1
+    assert "9.9.9" in instance.notifications[0]

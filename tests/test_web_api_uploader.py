@@ -24,6 +24,7 @@ import requests
 from fireshare_agent.config.app_config import WebApiSettings
 from fireshare_agent.config.secrets import WEB_API_SESSION_COOKIES, delete_secret, get_secret, set_secret
 from fireshare_agent.models import MediaKind, PendingFile
+from fireshare_agent.uploaders import web_api_uploader
 from fireshare_agent.uploaders.web_api_uploader import (
     MfaRequiredError,
     WebApiUploader,
@@ -127,6 +128,17 @@ def preserve_web_api_session_secret():
         set_secret(WEB_API_SESSION_COOKIES, original)
 
 
+def _saved_session(base_url: str, name: str, value: str, **attributes) -> str:
+    """A persisted-session blob in the current envelope shape."""
+    cookie = {"name": name, "value": value, "domain": "fireshare.example.com", "path": "/", "secure": True}
+    cookie.update(attributes)
+    return json.dumps({
+        "version": web_api_uploader._SESSION_ENVELOPE_VERSION,
+        "base_url": base_url,
+        "cookies": [cookie],
+    })
+
+
 def test_successful_login_persists_session_for_reuse(preserve_web_api_session_secret):
     delete_secret(WEB_API_SESSION_COOKIES)
     uploader = WebApiUploader(_settings())
@@ -146,15 +158,19 @@ def test_successful_login_persists_session_for_reuse(preserve_web_api_session_se
     assert saved is not None
     envelope = json.loads(saved)
     assert envelope["base_url"] == "https://fireshare.example.com"
-    assert envelope["cookies"]["session"] == "abc123"
+    assert envelope["version"] == web_api_uploader._SESSION_ENVELOPE_VERSION
+    [cookie] = envelope["cookies"]
+    assert cookie["name"] == "session"
+    assert cookie["value"] == "abc123"
+    # The attribute that confines the cookie to this server. Persisted as a flat {name: value} map
+    # it came back domainless, and requests sends a domainless cookie to every host the session
+    # contacts - including anywhere a redirect might land it.
+    assert cookie["domain"] == "fireshare.example.com"
 
 
 def test_fresh_uploader_resumes_persisted_session_without_logging_in_again(preserve_web_api_session_secret):
     # Simulates an app restart: a brand new uploader instance, but a session was saved earlier.
-    set_secret(WEB_API_SESSION_COOKIES, json.dumps({
-        "base_url": "https://fireshare.example.com",
-        "cookies": {"session": "already-valid-token"},
-    }))
+    set_secret(WEB_API_SESSION_COOKIES, _saved_session("https://fireshare.example.com", "session", "already-valid-token"))
     uploader = WebApiUploader(_settings())
     probe_response = _mock_response({})
     probe_response.status_code = 200
@@ -170,10 +186,7 @@ def test_fresh_uploader_resumes_persisted_session_without_logging_in_again(prese
 
 
 def test_expired_persisted_session_falls_back_to_fresh_login(preserve_web_api_session_secret):
-    set_secret(WEB_API_SESSION_COOKIES, json.dumps({
-        "base_url": "https://fireshare.example.com",
-        "cookies": {"session": "expired-token"},
-    }))
+    set_secret(WEB_API_SESSION_COOKIES, _saved_session("https://fireshare.example.com", "session", "expired-token"))
     uploader = WebApiUploader(_settings())
     probe_response = _mock_response({})
     probe_response.status_code = 401
@@ -190,10 +203,7 @@ def test_expired_persisted_session_falls_back_to_fresh_login(preserve_web_api_se
 
 
 def test_persisted_session_for_a_different_server_is_ignored(preserve_web_api_session_secret):
-    set_secret(WEB_API_SESSION_COOKIES, json.dumps({
-        "base_url": "https://other-server.example.com",
-        "cookies": {"session": "not-for-this-server"},
-    }))
+    set_secret(WEB_API_SESSION_COOKIES, _saved_session("https://other-server.example.com", "session", "not-for-this-server"))
     uploader = WebApiUploader(_settings())  # settings() base_url is https://fireshare.example.com
     login_response = _mock_response({})
 
@@ -429,3 +439,162 @@ def test_exists_at_destination_matches_same_name_in_the_same_folder(preserve_web
             found = uploader.exists_at_destination(file)
 
     assert found is True
+
+
+# --- Persisted cookies must keep their scoping ------------------------------------------------
+#
+# The jar used to be flattened with dict(self._session.cookies), which keeps only name/value, and
+# restored with cookies.set(name, value) and no domain. A domainless cookie in a requests session
+# is sent to *every* host that session contacts. Nothing in today's code paths talks to a second
+# host, so nothing leaked in practice - but the token handled this way is Flask-Login's long-lived
+# "remember me" cookie, the one deliberately persisted because it is durable, and any redirect onto
+# another host would have handed it over.
+
+
+def _jar_cookie(uploader, name: str):
+    return next(c for c in uploader._session.cookies if c.name == name)
+
+
+def test_a_restored_cookie_is_scoped_to_its_domain(preserve_web_api_session_secret):
+    set_secret(WEB_API_SESSION_COOKIES, _saved_session(
+        "https://fireshare.example.com", "remember_token", "durable-value",
+    ))
+    uploader = WebApiUploader(_settings())
+
+    uploader._load_persisted_session()
+
+    cookie = _jar_cookie(uploader, "remember_token")
+    assert cookie.domain == "fireshare.example.com"
+    assert cookie.value == "durable-value"
+
+
+def test_a_restored_cookie_is_not_sent_to_another_host(preserve_web_api_session_secret):
+    """The property that actually matters, asserted through requests' own cookie matching rather
+    than by reading back the attribute we just set. prepare_request() is the same call the session
+    makes for every real request, so this is the header the server would genuinely receive."""
+    set_secret(WEB_API_SESSION_COOKIES, _saved_session(
+        "https://fireshare.example.com", "remember_token", "durable-value",
+    ))
+    uploader = WebApiUploader(_settings())
+    uploader._load_persisted_session()
+
+    def cookie_header(url: str) -> str:
+        prepared = uploader._session.prepare_request(requests.Request("GET", url))
+        return prepared.headers.get("Cookie", "")
+
+    assert "durable-value" in cookie_header("https://fireshare.example.com/api/x")
+    assert cookie_header("https://attacker.example.net/api/x") == ""
+
+
+def test_a_domainless_cookie_would_have_leaked(preserve_web_api_session_secret):
+    """Characterises the old behaviour, so the test above is demonstrably testing something. This
+    is what cookies.set(name, value) with no domain does: matches every host."""
+    uploader = WebApiUploader(_settings())
+    uploader._session.cookies.set("remember_token", "durable-value")  # exactly the old restore call
+
+    prepared = uploader._session.prepare_request(
+        requests.Request("GET", "https://attacker.example.net/api/x")
+    )
+
+    assert "durable-value" in prepared.headers.get("Cookie", "")
+
+
+def test_a_cookie_saved_without_a_domain_falls_back_to_the_configured_host(preserve_web_api_session_secret):
+    """Never restore an unscoped cookie: if the stored blob has no domain, the configured host is
+    used instead of leaving it matching everything."""
+    set_secret(WEB_API_SESSION_COOKIES, json.dumps({
+        "version": web_api_uploader._SESSION_ENVELOPE_VERSION,
+        "base_url": "https://fireshare.example.com",
+        "cookies": [{"name": "session", "value": "v"}],
+    }))
+    uploader = WebApiUploader(_settings())
+
+    uploader._load_persisted_session()
+
+    assert _jar_cookie(uploader, "session").domain == "fireshare.example.com"
+
+
+def test_two_same_named_cookies_on_different_paths_both_survive(preserve_web_api_session_secret):
+    """dict(jar) silently kept only one of them."""
+    uploader = WebApiUploader(_settings())
+    uploader._session.cookies.set("token", "root-value", domain="fireshare.example.com", path="/")
+    uploader._session.cookies.set("token", "api-value", domain="fireshare.example.com", path="/api")
+
+    uploader._persist_session()
+
+    envelope = json.loads(get_secret(WEB_API_SESSION_COOKIES))
+    assert sorted(c["path"] for c in envelope["cookies"]) == ["/", "/api"]
+
+
+def test_a_null_valued_cookie_is_skipped_rather_than_deleting_one(preserve_web_api_session_secret):
+    """requests treats cookies.set(name, None) as a *deletion*, so a null value in the stored blob
+    would quietly remove a cookie instead of restoring one."""
+    set_secret(WEB_API_SESSION_COOKIES, json.dumps({
+        "version": web_api_uploader._SESSION_ENVELOPE_VERSION,
+        "base_url": "https://fireshare.example.com",
+        "cookies": [
+            {"name": "session", "value": None, "domain": "fireshare.example.com"},
+            {"name": "remember_token", "value": "kept", "domain": "fireshare.example.com"},
+        ],
+    }))
+    uploader = WebApiUploader(_settings())
+
+    uploader._load_persisted_session()
+
+    assert [c.name for c in uploader._session.cookies] == ["remember_token"]
+
+
+def test_an_old_format_session_blob_is_discarded_not_misread(preserve_web_api_session_secret):
+    """A v1 blob is a {name: value} map where v2 expects a list of dicts. Reading it under the new
+    rules would iterate the *keys*; the version field makes it a clean discard and one fresh
+    login."""
+    set_secret(WEB_API_SESSION_COOKIES, json.dumps({
+        "base_url": "https://fireshare.example.com",
+        "cookies": {"session": "from-the-old-format"},
+    }))
+    uploader = WebApiUploader(_settings())
+
+    uploader._load_persisted_session()
+
+    assert len(uploader._session.cookies) == 0
+
+
+def test_a_trailing_slash_difference_does_not_throw_the_session_away(preserve_web_api_session_secret):
+    """base_url was compared as an exact string, so a trailing slash typed this time but not last
+    time silently discarded a valid session - and with TOTP enabled, that means a fresh prompt."""
+    set_secret(WEB_API_SESSION_COOKIES, _saved_session(
+        "https://fireshare.example.com/", "session", "still-good",
+    ))
+    uploader = WebApiUploader(_settings())  # configured without the trailing slash
+
+    uploader._load_persisted_session()
+
+    assert _jar_cookie(uploader, "session").value == "still-good"
+
+
+def test_a_session_saved_for_another_server_is_still_rejected(preserve_web_api_session_secret):
+    """Normalising trailing slashes must not soften the check itself."""
+    set_secret(WEB_API_SESSION_COOKIES, _saved_session(
+        "https://other-server.example.com", "session", "not-for-this-server",
+    ))
+    uploader = WebApiUploader(_settings())
+
+    uploader._load_persisted_session()
+
+    assert len(uploader._session.cookies) == 0
+
+
+def test_a_persisted_session_round_trips(preserve_web_api_session_secret):
+    """Save then load must reproduce the same jar, so persistence is transparent rather than a
+    lossy re-derivation."""
+    saver = WebApiUploader(_settings())
+    saver._session.cookies.set("session", "s-value", domain="fireshare.example.com", path="/")
+    saver._session.cookies.set("remember_token", "r-value", domain="fireshare.example.com", path="/")
+    saver._persist_session()
+
+    loader = WebApiUploader(_settings())
+    loader._load_persisted_session()
+
+    assert {(c.name, c.value, c.domain, c.path) for c in loader._session.cookies} == {
+        (c.name, c.value, c.domain, c.path) for c in saver._session.cookies
+    }

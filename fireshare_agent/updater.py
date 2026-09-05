@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -29,6 +30,12 @@ log = logging.getLogger(__name__)
 _REPO = "J-Stuff/fireshare-agent"
 _API_LATEST_RELEASE = f"https://api.github.com/repos/{_REPO}/releases/latest"
 _REQUEST_HEADERS = {"Accept": "application/vnd.github+json"}
+
+# A release tag reaches us as attacker-influenceable text (a hostile or compromised release can name
+# a tag anything) and is then used as a directory name under %AppData%. Anything outside this set -
+# a separator, a drive letter, a parent reference - must never reach the filesystem.
+_SAFE_PATH_SEGMENT = re.compile(r"[A-Za-z0-9._-]+")
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 
 @dataclass(frozen=True)
@@ -73,6 +80,12 @@ def check_for_update(timeout: float = 10.0) -> UpdateInfo | None:
     if not tag or parse_version(tag) <= parse_version(__version__):
         return None
 
+    if not _is_safe_path_segment(tag.lstrip("vV")):
+        # Rejected here as well as in apply_update() so a malformed release never even surfaces as
+        # an offer the user can click.
+        log.warning("Ignoring release %r: the tag is not usable as a directory name.", tag)
+        return None
+
     assets = data.get("assets") or []
     installer_asset = next((a for a in assets if a.get("name", "").lower().endswith(".exe")), None)
     if installer_asset is None:
@@ -89,26 +102,34 @@ def check_for_update(timeout: float = 10.0) -> UpdateInfo | None:
 
 
 def apply_update(info: UpdateInfo, on_exit: Callable[[], None]) -> None:
-    """Downloads the release installer, verifies its checksum if one was published, then launches
-    it silently and calls on_exit() to quit this process and hand off control. Raises on failure
-    (download error, checksum mismatch) so the caller can show that to the user - nothing has
+    """Downloads the release installer, verifies its checksum, then launches it silently and calls
+    on_exit() to quit this process and hand off control. Raises on failure (download error, missing
+    or unusable checksum, checksum mismatch) so the caller can show that to the user - nothing has
     touched the installed files at that point.
 
     Passes /CURRENTUSER or /ALLUSERS matching how this install was originally set up, so the
     installer repeats that choice instead of prompting for it again on what's meant to be an
     unattended update."""
+    if not _is_safe_path_segment(info.version):
+        raise RuntimeError(f"Refusing to stage an update for an unsafe release name: {info.version!r}")
+
     install_dir = Path(sys.executable).resolve().parent
-    staging_dir = app_data_dir() / "update" / info.version
+    update_root = app_data_dir() / "update"
+    staging_dir = update_root / info.version
+    # Checked against the resolved paths, not the strings, so a symlinked component is caught too -
+    # and checked before mkdir, so a rejected name never gets a directory created for it.
+    _reject_escape(staging_dir, update_root)
     staging_dir.mkdir(parents=True, exist_ok=True)
     installer_path = staging_dir / "FireshareAgentSetup.exe"
 
+    # Fetched before the download so a release that cannot be verified fails fast, rather than
+    # after pulling down an installer that was never going to be run.
+    expected = _expected_sha256(info)
     _download_file(info.download_url, installer_path)
 
-    if info.checksum_url:
-        expected = _download_text(info.checksum_url).split()[0].strip().lower()
-        actual = _sha256(installer_path).lower()
-        if expected and expected != actual:
-            raise RuntimeError("Downloaded update failed checksum verification - aborting.")
+    actual = _sha256(installer_path).lower()
+    if expected != actual:
+        raise RuntimeError("Downloaded update failed checksum verification - aborting.")
 
     mode_flag = "/ALLUSERS" if _is_all_users_install(install_dir) else "/CURRENTUSER"
     subprocess.Popen(
@@ -117,6 +138,48 @@ def apply_update(info: UpdateInfo, on_exit: Callable[[], None]) -> None:
         close_fds=True,
     )
     on_exit()
+
+
+def _is_safe_path_segment(value: str) -> bool:
+    """True if `value` is safe to use as a single directory name. `fullmatch` rules out separators
+    and drive letters; the explicit `.`/`..` check is the case the character class alone misses -
+    ".." is made entirely of permitted characters but still walks up a level."""
+    return bool(value) and value not in (".", "..") and _SAFE_PATH_SEGMENT.fullmatch(value) is not None
+
+
+def _reject_escape(candidate: Path, expected_parent: Path) -> None:
+    if expected_parent.resolve() not in candidate.resolve().parents:
+        raise RuntimeError("Refusing to stage an update outside the update directory.")
+
+
+def _expected_sha256(info: UpdateInfo) -> str:
+    """The digest this release's installer must hash to, or a raised error explaining why the
+    update cannot proceed.
+
+    Fails closed, deliberately. What follows verification is "run this downloaded executable
+    silently, elevated via UAC on an all-users install" - the one code path that must not have an
+    implicit skip in it. Previously a release that published no .sha256 asset was installed with no
+    integrity check at all, and an empty or malformed checksum file did the same, because the guard
+    was `if expected and expected != actual` and an empty string is falsy. Transport is HTTPS to
+    GitHub either way, so this is defence in depth rather than a live exploit - but the failure mode
+    it removes is silent."""
+    manual = f"Download and install it manually from {info.notes_url}"
+    if not info.checksum_url:
+        raise RuntimeError(
+            "This release did not publish a checksum, so the download cannot be verified. "
+            f"{manual}"
+        )
+
+    tokens = _download_text(info.checksum_url).split()
+    # An empty checksum file used to reach .split()[0] and raise IndexError, which the caller's
+    # broad except turned into a confusingly generic "Update Failed".
+    candidate = tokens[0].strip().lower() if tokens else ""
+    if _SHA256_HEX.fullmatch(candidate) is None:
+        raise RuntimeError(
+            "This release's checksum file is not a valid SHA-256 digest, so the download cannot "
+            f"be verified. {manual}"
+        )
+    return candidate
 
 
 def _is_all_users_install(install_dir: Path) -> bool:

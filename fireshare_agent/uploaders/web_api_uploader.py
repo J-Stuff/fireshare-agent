@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import time
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlparse
 
 import requests
 import urllib3
@@ -33,7 +35,14 @@ from fireshare_agent.config.secrets import WEB_API_PASSWORD, WEB_API_SESSION_COO
 from fireshare_agent.models import ConnectionTestResult, MediaKind, PendingFile, UploadResult
 from fireshare_agent.uploaders.base import Uploader
 
+log = logging.getLogger(__name__)
+
 _EXISTING_ENTRIES_CACHE_TTL_SECONDS = 60
+
+# Bumped whenever the persisted-session envelope changes shape. v1 stored a flat {name: value}
+# map, which lost every cookie attribute; anything that isn't the current version is discarded and
+# re-earned by a fresh login rather than reinterpreted under new rules.
+_SESSION_ENVELOPE_VERSION = 2
 
 
 class MfaRequiredError(Exception):
@@ -54,6 +63,17 @@ class WebApiUploader(Uploader):
         self._session = requests.Session()
         self._session.verify = not settings.ignore_certificate_errors
         if settings.ignore_certificate_errors:
+            # Logged as well as suppressed, so running without TLS verification leaves a trace
+            # instead of being invisible. disable_warnings() edits the process-wide warnings
+            # filter and there is no per-session equivalent, so one uploader pointed at a
+            # self-signed server silences the warning for every later uploader too. That is
+            # tolerable rather than ideal: urllib3 only raises InsecureRequestWarning for a request
+            # made *without* verification, so an uploader that verifies normally has no warning to
+            # lose - the filter cannot hide a problem with a properly-certificated host.
+            log.warning(
+                "TLS certificate verification is DISABLED for %s (per this server's settings).",
+                settings.base_url,
+            )
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         self._authenticated = False
         self._resume_attempted = False
@@ -142,17 +162,61 @@ class WebApiUploader(Uploader):
             envelope = json.loads(raw)
         except json.JSONDecodeError:
             return
-        if envelope.get("base_url") != self._settings.base_url:
+        if not isinstance(envelope, dict) or envelope.get("version") != _SESSION_ENVELOPE_VERSION:
+            return  # absent or older shape - discard rather than guess at what it meant
+        if _normalized_base_url(envelope.get("base_url") or "") != _normalized_base_url(self._settings.base_url):
             return  # saved session was for a different server; don't try to reuse it
-        for name, value in envelope.get("cookies", {}).items():
-            self._session.cookies.set(name, value)
+
+        host = self._session_host()
+        for cookie in envelope.get("cookies") or []:
+            if not isinstance(cookie, dict):
+                continue
+            name, value = cookie.get("name"), cookie.get("value")
+            # requests treats set(name, None) as a *deletion*, so a null value would quietly
+            # remove a cookie rather than restore one.
+            if not name or value is None:
+                continue
+            # The domain is what confines the cookie to this server. A cookie restored without one
+            # is sent to every host the session ever contacts, and the token being restored here is
+            # Flask-Login's long-lived "remember me" cookie - the durable one. Rather than restore
+            # an unscoped cookie, fall back to the configured host, and skip it entirely if even
+            # that is unknown.
+            domain = cookie.get("domain") or host
+            if not domain:
+                continue
+            self._session.cookies.set(
+                name, value,
+                domain=domain,
+                path=cookie.get("path") or "/",
+                secure=bool(cookie.get("secure")),
+            )
 
     def _persist_session(self) -> None:
-        cookie_dict = dict(self._session.cookies)
-        if not cookie_dict:
+        # Iterated rather than dict()-flattened: dict(jar) keeps only name/value, dropping the
+        # domain/path scoping above and silently discarding one of two same-named cookies scoped
+        # to different paths.
+        cookies = [
+            {
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": cookie.domain or self._session_host(),
+                "path": cookie.path or "/",
+                "secure": bool(cookie.secure),
+            }
+            for cookie in self._session.cookies
+            if cookie.value is not None
+        ]
+        if not cookies:
             return
-        envelope = {"base_url": self._settings.base_url, "cookies": cookie_dict}
+        envelope = {
+            "version": _SESSION_ENVELOPE_VERSION,
+            "base_url": self._settings.base_url,
+            "cookies": cookies,
+        }
         set_secret(WEB_API_SESSION_COOKIES, json.dumps(envelope))
+
+    def _session_host(self) -> str:
+        return urlparse(self._settings.base_url).hostname or ""
 
     def _clear_session_state(self) -> None:
         self._session.cookies.clear()
@@ -305,6 +369,13 @@ class WebApiUploader(Uploader):
 
     def _url(self, path: str) -> str:
         return f"{self._settings.base_url.rstrip('/')}{path}"
+
+
+def _normalized_base_url(base_url: str) -> str:
+    """Trailing slashes are cosmetic - _url() strips them before building every request - so a
+    saved session must not be thrown away (forcing a fresh login, and a fresh TOTP prompt) just
+    because the user typed one this time and not last time."""
+    return base_url.strip().rstrip("/")
 
 
 def _normalize_filename(name: str) -> str:

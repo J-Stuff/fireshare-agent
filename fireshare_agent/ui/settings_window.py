@@ -28,7 +28,7 @@ from fireshare_agent.config.app_config import (
     WatchFolderConfig,
     clamp,
 )
-from fireshare_agent.config.secrets import WEB_API_PASSWORD, set_secret
+from fireshare_agent.config.secrets import WEB_API_PASSWORD, delete_secret, get_secret, set_secret
 from fireshare_agent.models import PostUploadAction
 from fireshare_agent.ui import mfa_dialog, widgets
 from fireshare_agent.uploaders import cloudflare
@@ -257,7 +257,9 @@ class SettingsWindow(ctk.CTkToplevel):
     def _test_web_api_connection(self) -> None:
         widgets.set_status(self._connection_status_label, "info", "Testing...")
         # persist_secrets=True: a freshly typed password must be usable immediately, not only
-        # after Save + reopening Settings.
+        # after Save + reopening Settings - and the MFA follow-up inside test_connection() reads
+        # the password back out of Credential Manager, so it has to be there before the call.
+        previous_password = get_secret(WEB_API_PASSWORD)
         working_config = self._build_config_from_fields(persist_secrets=True)
 
         def worker() -> None:
@@ -265,8 +267,10 @@ class SettingsWindow(ctk.CTkToplevel):
                 uploader = WebApiUploader(working_config.web_api, mfa_code_provider=self._prompt_for_mfa_code)
                 result = uploader.test_connection()
             except Exception as ex:  # a bad field value shouldn't crash the settings window
+                _keep_password_only_if_confirmed(previous_password, confirmed=False)
                 self.after(0, lambda: widgets.set_status(self._connection_status_label, "error", str(ex)))
                 return
+            _keep_password_only_if_confirmed(previous_password, confirmed=result.success)
             self.after(0, lambda: widgets.set_status(self._connection_status_label, "success" if result.success else "error", result.message))
             self.after(0, self._check_cloudflare_chunk_limit)
 
@@ -274,6 +278,7 @@ class SettingsWindow(ctk.CTkToplevel):
 
     def _fetch_web_api_folders(self) -> None:
         # persist_secrets=True for the same reason as _test_web_api_connection above.
+        previous_password = get_secret(WEB_API_PASSWORD)
         working_config = self._build_config_from_fields(persist_secrets=True)
         widgets.set_status(self._connection_status_label, "info", "Fetching folders...")
 
@@ -282,8 +287,10 @@ class SettingsWindow(ctk.CTkToplevel):
                 uploader = WebApiUploader(working_config.web_api, mfa_code_provider=self._prompt_for_mfa_code)
                 folders = uploader.list_upload_folders()
             except Exception as ex:
+                _keep_password_only_if_confirmed(previous_password, confirmed=False)
                 self.after(0, lambda: widgets.set_status(self._connection_status_label, "error", f"Could not fetch folders: {ex}"))
                 return
+            _keep_password_only_if_confirmed(previous_password, confirmed=True)
 
             if folders:
                 self.after(0, lambda: self._webapi_folder_combo.configure(values=folders))
@@ -376,7 +383,12 @@ class SettingsWindow(ctk.CTkToplevel):
         ).pack(anchor="w", pady=(2, 0))
 
         startup_body = widgets.section_card(tab, "Startup & Notifications")
-        self._start_with_windows_var = ctk.BooleanVar(value=self._config.start_with_windows)
+        # Read from the registry rather than from the saved config. The Run entry can be removed
+        # behind the app's back (a cleanup utility, another startup manager, a manual regedit), and
+        # rendering the config would leave the checkbox ticked while the app no longer starts with
+        # Windows. Whatever is shown here is what Save writes back, so opening Settings and saving
+        # also resolves the drift.
+        self._start_with_windows_var = ctk.BooleanVar(value=_start_with_windows_state(self._config))
         ctk.CTkCheckBox(startup_body, text="Start Fireshare Agent automatically when you sign in to Windows", variable=self._start_with_windows_var, font=widgets.body_font()).pack(anchor="w", pady=4)
         self._notifications_var = ctk.BooleanVar(value=self._config.show_upload_notifications)
         ctk.CTkCheckBox(startup_body, text="Show a tray notification for each upload", variable=self._notifications_var, font=widgets.body_font()).pack(anchor="w", pady=4)
@@ -496,6 +508,39 @@ class SettingsWindow(ctk.CTkToplevel):
 
         self._on_save(new_config)
         self.destroy()
+
+
+def _keep_password_only_if_confirmed(previous_password: str | None, confirmed: bool) -> None:
+    """Rolls the stored password back to what it was, unless the server just confirmed the new one.
+
+    Test Connection has to write the password to Credential Manager *before* the test, because the
+    MFA follow-up inside the login flow reads it back from there. The cost used to be that a typo
+    was persisted permanently: the user tests, sees "login failed", closes Settings without saving,
+    and the background pipeline goes on retrying with the wrong password - which is exactly how an
+    account ends up locked out by its own uploader. Narrowing the window to the duration of the
+    test keeps the MFA flow working while removing that trap.
+
+    A cancelled MFA prompt counts as unconfirmed and reverts, even though reaching the MFA step
+    proves the password was right. Reverting to the previous known state is the conservative
+    choice, and Save still persists unconditionally."""
+    if confirmed:
+        return
+    if previous_password is None:
+        delete_secret(WEB_API_PASSWORD)
+    else:
+        set_secret(WEB_API_PASSWORD, previous_password)
+
+
+def _start_with_windows_state(config: AppConfig) -> bool:
+    """What the "Start with Windows" checkbox should show: the registry's answer, falling back to
+    the saved config only if the registry cannot be read at all (a non-Windows host, where the
+    module's `winreg` import fails outright). is_enabled() already absorbs its own OSErrors."""
+    try:
+        from fireshare_agent import startup
+
+        return startup.is_enabled()
+    except Exception:
+        return config.start_with_windows
 
 
 def _split_extensions(raw: str) -> list[str]:

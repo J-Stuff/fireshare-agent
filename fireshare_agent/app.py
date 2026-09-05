@@ -5,6 +5,7 @@ import logging
 import sys
 import threading
 import tkinter.messagebox as messagebox
+from enum import Enum
 
 import customtkinter as ctk
 
@@ -20,6 +21,44 @@ from fireshare_agent.ui.settings_window import SettingsWindow
 from fireshare_agent.ui.tray import TrayIcon
 
 log = logging.getLogger(__name__)
+
+
+class UpdateCheckResponse(Enum):
+    """What the user should be shown after an update check. Split out from the code that shows it
+    so the decision can be tested without a UI - `_on_update_check_result` is otherwise pure
+    dispatch into modal dialogs and tray balloons."""
+
+    OFFER_UPDATE = "offer_update"      # jump straight to the confirm-and-install dialog
+    ANNOUNCE_UPDATE = "announce_update"  # unobtrusive tray balloon
+    ALREADY_CURRENT = "already_current"  # modal "you are up to date"
+    NOTHING = "nothing"
+
+
+def decide_update_check_response(
+    update_available: bool, user_initiated: bool, announce_automatic_updates: bool,
+) -> UpdateCheckResponse:
+    """A check the user explicitly asked for is owed a definite answer in *both* directions.
+
+    The old shape got this backwards. "No update" - the less interesting outcome - got a modal
+    window, while "update available" got only a transient tray balloon, and that balloon was gated
+    on `show_upload_notifications`, the per-upload notification toggle. Turning that off is entirely
+    reasonable for a background uploader, and it meant a manual check with an update waiting
+    produced no feedback of any kind: click the button, nothing happens.
+
+    So a user-initiated check with an update available now goes straight to the confirm dialog. The
+    user asked about updates, there is one, and that dialog already names the version and explains
+    what will happen - which collapses "read balloon, find the tray icon, open the menu, click
+    update" into a single click. It also sidesteps the balloon's other problem: it said "see the
+    tray menu", but a manual check is launched from Settings > Advanced, so the window the user is
+    looking at is very likely covering the tray icon it points them at.
+
+    The automatic startup check keeps the balloon - a modal on launch would be an ambush - but gated
+    on a flag that actually means "tell me about updates"."""
+    if update_available:
+        if user_initiated:
+            return UpdateCheckResponse.OFFER_UPDATE
+        return UpdateCheckResponse.ANNOUNCE_UPDATE if announce_automatic_updates else UpdateCheckResponse.NOTHING
+    return UpdateCheckResponse.ALREADY_CURRENT if user_initiated else UpdateCheckResponse.NOTHING
 
 
 class FireshareAgentApp:
@@ -166,10 +205,21 @@ class FireshareAgentApp:
         if self.tray:
             self.tray.refresh()
 
-        if info is not None:
-            if self.config.show_upload_notifications:
-                self._notify(f"Fireshare Agent {info.version} is available - see the tray menu to update.")
-        elif notify_if_none:
+        # notify_if_none is really "the user pressed the button", which now governs both branches
+        # rather than only the no-update one.
+        response = decide_update_check_response(
+            update_available=info is not None,
+            user_initiated=notify_if_none,
+            # Someone who turned automatic checks on has already said they want to hear about
+            # updates; the per-upload notification toggle says nothing about that.
+            announce_automatic_updates=self.config.auto_check_for_updates,
+        )
+
+        if response == UpdateCheckResponse.OFFER_UPDATE:
+            self.confirm_and_apply_update()
+        elif response == UpdateCheckResponse.ANNOUNCE_UPDATE and info is not None:
+            self._notify(f"Fireshare Agent {info.version} is available - see the tray menu to update.")
+        elif response == UpdateCheckResponse.ALREADY_CURRENT:
             messagebox.showinfo("Fireshare Agent", f"You're already on the latest version ({__version__}).")
 
     def confirm_and_apply_update(self) -> None:
@@ -232,7 +282,10 @@ class FireshareAgentApp:
             if self.tray:
                 self.tray.icon.notify(message, title="Fireshare Agent")
         except Exception:
-            pass  # notifications are a nicety, never worth crashing the pipeline over
+            # Still swallowed - a balloon is never worth crashing the pipeline over - but recorded,
+            # so "the notification never appeared" is diagnosable rather than indistinguishable from
+            # "the notification was never attempted".
+            log.debug("Could not show a tray notification: %s", message, exc_info=True)
 
     def exit_app(self) -> None:
         log.info("Shutting down.")
