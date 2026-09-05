@@ -158,10 +158,19 @@ class WebApiUploader(Uploader):
         self._session.cookies.clear()
         delete_secret(WEB_API_SESSION_COOKIES)
 
+    def _resolve_folder(self, file: PendingFile) -> str:
+        """The Fireshare folder to upload into: the file's local subfolder (mirroring
+        ShadowPlay's per-game layout) when that's enabled and known, otherwise the configured
+        fixed target folder (which may itself be empty, meaning Fireshare's own server default)."""
+        if self._settings.mirror_local_folder_structure and file.remote_folder_hint:
+            return file.remote_folder_hint
+        return self._settings.target_folder
+
     def _upload_video_chunked(self, file: PendingFile) -> None:
         chunk_size = max(1, self._settings.chunk_size_bytes)
         total_chunks = max(1, -(-file.size_bytes // chunk_size))  # ceil division
         file_name = Path(file.path).name
+        folder = self._resolve_folder(file)
         # Stable per (path, size) rather than a fresh random value per call: Fireshare names
         # chunk parts on disk as f"{checkSum}.part{chunkPart:04d}" and only cleans them up on a
         # successful reassembly (confirmed against the server source - abandoned chunks
@@ -175,9 +184,9 @@ class WebApiUploader(Uploader):
         with open(file.path, "rb") as f:
             for part in range(1, total_chunks + 1):  # Fireshare's chunk loop is 1-indexed
                 chunk = f.read(chunk_size)
-                self._post_chunk(chunk, part, total_chunks, check_sum, file_name, file.size_bytes)
+                self._post_chunk(chunk, part, total_chunks, check_sum, file_name, file.size_bytes, folder)
 
-    def _post_chunk(self, chunk: bytes, part: int, total_chunks: int, check_sum: str, file_name: str, size_bytes: int) -> None:
+    def _post_chunk(self, chunk: bytes, part: int, total_chunks: int, check_sum: str, file_name: str, size_bytes: int, folder: str) -> None:
         data = {
             "chunkPart": str(part),
             "totalChunks": str(total_chunks),
@@ -185,8 +194,8 @@ class WebApiUploader(Uploader):
             "fileName": file_name,
             "fileSize": str(size_bytes),
         }
-        if self._settings.target_folder:
-            data["folder"] = self._settings.target_folder
+        if folder:
+            data["folder"] = folder
 
         response = self._session.post(
             self._url("/api/uploadChunked"),
@@ -210,7 +219,8 @@ class WebApiUploader(Uploader):
 
     def _upload_image(self, file: PendingFile) -> None:
         file_name = Path(file.path).name
-        data = {"folder": self._settings.target_folder} if self._settings.target_folder else {}
+        folder = self._resolve_folder(file)
+        data = {"folder": folder} if folder else {}
 
         response = self._post_image(file.path, file_name, data)
         if response.status_code == 401:
@@ -245,14 +255,30 @@ class WebApiUploader(Uploader):
 
         target_stem = _normalize_filename(Path(file.path).name)
         target_ext = Path(file.path).suffix.lstrip(".").lower()
+        # Folder-aware now that folders carry real meaning (mirrored per-game subfolders): two
+        # different games' clips can legitimately share a filename, so a folder mismatch means
+        # "different file", not "already uploaded". Only enforced when we actually know which
+        # folder this file would land in - an empty target_folder (Fireshare's own default) still
+        # falls back to name-only matching.
+        target_folder = _normalize_filename(self._resolve_folder(file))
 
         for entry in entries:
             stored_path = entry.get("path") or ""
             if not stored_path:
                 continue
             stored_ext = (entry.get("extension") or "").lower()
-            if _normalize_filename(Path(stored_path).name) == target_stem and (not stored_ext or stored_ext == target_ext):
-                return True
+            stored_path_obj = Path(stored_path)
+
+            if _normalize_filename(stored_path_obj.name) != target_stem:
+                continue
+            if stored_ext and stored_ext != target_ext:
+                continue
+
+            stored_folder = _normalize_filename(str(stored_path_obj.parent)) if stored_path_obj.parent != Path(".") else ""
+            if target_folder and stored_folder and stored_folder != target_folder:
+                continue  # same filename, different folder - treat as a distinct file
+
+            return True
         return False
 
     def _fetch_existing_entries(self, kind: MediaKind) -> list[dict]:

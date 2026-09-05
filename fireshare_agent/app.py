@@ -4,10 +4,11 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+import tkinter.messagebox as messagebox
 
 import customtkinter as ctk
 
-from fireshare_agent import assets
+from fireshare_agent import __version__, assets, updater
 from fireshare_agent.config import store as config_store
 from fireshare_agent.config.app_config import AppConfig
 from fireshare_agent.manifest.store import ManifestStore
@@ -43,6 +44,7 @@ class FireshareAgentApp:
         self.settings_window: SettingsWindow | None = None
         self.activity_window: ActivityWindow | None = None
         self.tray: TrayIcon | None = None
+        self._update_info: updater.UpdateInfo | None = None
 
     def run(self) -> None:
         self.pipeline.start()
@@ -56,9 +58,15 @@ class FireshareAgentApp:
             is_paused=lambda: self.pipeline.is_paused,
             has_failures=lambda: self.pipeline.failed_count > 0,
             on_exit=lambda: self.run_on_ui_thread(self.exit_app),
+            has_update=lambda: self._update_info is not None,
+            update_version=lambda: self._update_info.version if self._update_info else "",
+            on_update_now=lambda: self.run_on_ui_thread(self.confirm_and_apply_update),
         )
         tray_thread = threading.Thread(target=self.tray.run, daemon=True, name="fireshare-agent-tray")
         tray_thread.start()
+
+        if self.config.auto_check_for_updates:
+            self.check_for_updates(notify_if_none=False)
 
         self.root.mainloop()
 
@@ -70,7 +78,10 @@ class FireshareAgentApp:
             self.settings_window.lift()
             self.settings_window.focus_force()
             return
-        self.settings_window = SettingsWindow(self.root, self.config, on_save=self._on_settings_saved)
+        self.settings_window = SettingsWindow(
+            self.root, self.config, on_save=self._on_settings_saved,
+            on_check_for_updates=lambda: self.check_for_updates(notify_if_none=True),
+        )
 
     def open_activity(self) -> None:
         if self.activity_window is not None and self.activity_window.winfo_exists():
@@ -93,6 +104,44 @@ class FireshareAgentApp:
             self.pipeline.pause()
         if self.tray:
             self.tray.refresh()
+
+    def check_for_updates(self, notify_if_none: bool = True) -> None:
+        """Runs the (network) version check on a background thread so it never blocks the UI
+        thread or delays startup, then hands the result back via run_on_ui_thread."""
+        def worker() -> None:
+            info = updater.check_for_update()
+            self.run_on_ui_thread(lambda: self._on_update_check_result(info, notify_if_none))
+
+        threading.Thread(target=worker, daemon=True, name="fireshare-agent-update-check").start()
+
+    def _on_update_check_result(self, info: updater.UpdateInfo | None, notify_if_none: bool) -> None:
+        self._update_info = info
+        if self.tray:
+            self.tray.refresh()
+
+        if info is not None:
+            if self.config.show_upload_notifications:
+                self._notify(f"Fireshare Agent {info.version} is available - see the tray menu to update.")
+        elif notify_if_none:
+            messagebox.showinfo("Fireshare Agent", f"You're already on the latest version ({__version__}).")
+
+    def confirm_and_apply_update(self) -> None:
+        info = self._update_info
+        if info is None:
+            return
+
+        if not messagebox.askyesno(
+            "Update Available",
+            f"Fireshare Agent {info.version} is available (you're on {__version__}).\n\n"
+            "The app will close and restart automatically to apply it. Update now?",
+        ):
+            return
+
+        try:
+            updater.apply_update(info, on_exit=self.exit_app)
+        except Exception as ex:
+            log.exception("Failed to apply update")
+            messagebox.showerror("Update Failed", f"Could not apply the update:\n\n{ex}\n\nYou can also download it manually from {info.notes_url}")
 
     def _prompt_for_mfa_code(self) -> str | None:
         """Called from the pipeline's worker thread; blocks it while a modal prompt runs on the UI thread."""

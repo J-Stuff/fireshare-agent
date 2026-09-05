@@ -181,7 +181,10 @@ class UploadPipeline:
             return True
 
         uploader = self._get_or_create_uploader()
-        pending_file = PendingFile(path=path, kind=kind, size_bytes=size_bytes)
+        pending_file = PendingFile(
+            path=path, kind=kind, size_bytes=size_bytes,
+            remote_folder_hint=self._compute_remote_folder_hint(path),
+        )
 
         # Best-effort check against the actual destination (not just our local history) - covers
         # a lost/fresh-install manifest, or a file that was already uploaded some other way.
@@ -247,6 +250,36 @@ class UploadPipeline:
             return MediaKind.VIDEO
         if ext in {e.lower() for e in self._config.image_extensions}:
             return MediaKind.IMAGE
+        return None
+
+    def _compute_remote_folder_hint(self, path: str) -> str | None:
+        """The file's subfolder relative to whichever configured watch folder contains it (e.g.
+        "HELLDIVERS 2" for .../captures/HELLDIVERS 2/clip.mp4) - ShadowPlay's default layout is
+        one subfolder per game under the capture root, and this lets that carry over to Fireshare
+        instead of every file landing in one flat folder. None if the file sits directly in a
+        watch folder's root."""
+        file_dir = os.path.dirname(path)
+        for folder in self._config.watch_folders:
+            if not folder.path:
+                continue
+            try:
+                watch_root = os.path.realpath(folder.path)
+                candidate_dir = os.path.realpath(file_dir)
+            except OSError:
+                continue
+
+            if candidate_dir == watch_root:
+                return None  # directly in the watch root, nothing to mirror
+
+            try:
+                rel = os.path.relpath(candidate_dir, watch_root)
+            except ValueError:
+                continue  # e.g. different drives on Windows - not actually under this root
+
+            if rel == os.curdir or rel.startswith(os.pardir):
+                continue  # not actually inside this watch folder
+
+            return rel.replace(os.sep, "/")
         return None
 
     def _raise_activity(self, path: str, kind: MediaKind, event_kind: PipelineEventKind, message: str | None = None) -> None:

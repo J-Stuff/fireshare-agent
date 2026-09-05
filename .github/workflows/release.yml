@@ -1,0 +1,101 @@
+name: Release
+
+# Fully automatic: every push to main that contains a conventional-commit "feat"/"fix"/etc.
+# since the last release bumps the version, tags it, and publishes a GitHub Release - no manual
+# tagging step. A push with only non-release-worthy commits (chore/docs/refactor with no
+# breaking change) is a no-op: the version job's `released` output is false and the build job
+# is skipped entirely, so it never uploads an empty/duplicate release.
+on:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: Run tests
+        run: python -m pytest tests -v
+
+  version:
+    needs: test
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-release-${{ github.ref_name }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    outputs:
+      released: ${{ steps.release.outputs.released }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Force release branch to be at workflow sha
+        run: git reset --hard ${{ github.sha }}
+
+      - name: Semantic Version Release
+        id: release
+        uses: python-semantic-release/python-semantic-release@v10.6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          git_committer_name: "github-actions"
+          git_committer_email: "actions@users.noreply.github.com"
+
+  build:
+    needs: version
+    if: needs.version.outputs.released == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Build with PyInstaller
+        run: pyinstaller packaging\fireshare_agent.spec --noconfirm
+
+      - name: Zip the build
+        shell: pwsh
+        run: |
+          $tag = "${{ needs.version.outputs.tag }}"
+          Compress-Archive -Path dist\FireshareAgent\* -DestinationPath "FireshareAgent-$tag-win64.zip"
+
+      - name: Compute checksum
+        shell: pwsh
+        run: |
+          $tag = "${{ needs.version.outputs.tag }}"
+          $zipName = "FireshareAgent-$tag-win64.zip"
+          $hash = (Get-FileHash $zipName -Algorithm SHA256).Hash
+          "$hash  $zipName" | Out-File -Encoding ascii "$zipName.sha256"
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $tag = "${{ needs.version.outputs.tag }}"
+          gh release upload $tag "FireshareAgent-$tag-win64.zip" "FireshareAgent-$tag-win64.zip.sha256" --clobber --repo ${{ github.repository }}

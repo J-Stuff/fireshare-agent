@@ -299,7 +299,7 @@ def test_chunked_upload_checksum_differs_for_different_files(tmp_path):
     uploader = WebApiUploader(_settings())
     seen: dict[str, str] = {}
 
-    def capture(chunk, part, total_chunks, check_sum, file_name, size_bytes):
+    def capture(chunk, part, total_chunks, check_sum, file_name, size_bytes, folder):
         seen[file_name] = check_sum
 
     with patch.object(uploader, "_post_chunk", side_effect=capture):
@@ -325,3 +325,107 @@ def test_upload_invalidates_the_existing_entries_cache(tmp_path, preserve_web_ap
 
     assert result.success is True
     assert MediaKind.VIDEO not in uploader._existing_entries_cache
+
+
+def test_resolve_folder_prefers_the_local_subfolder_hint_when_mirroring_is_on():
+    settings = _settings()
+    settings.mirror_local_folder_structure = True
+    settings.target_folder = "Fallback"
+    uploader = WebApiUploader(settings)
+
+    file = PendingFile(path=r"C:\Clips\clip.mp4", kind=MediaKind.VIDEO, size_bytes=1, remote_folder_hint="SomeGame")
+
+    assert uploader._resolve_folder(file) == "SomeGame"
+
+
+def test_resolve_folder_falls_back_to_target_folder_without_a_hint():
+    settings = _settings()
+    settings.mirror_local_folder_structure = True
+    settings.target_folder = "Fallback"
+    uploader = WebApiUploader(settings)
+
+    file = PendingFile(path=r"C:\Clips\clip.mp4", kind=MediaKind.VIDEO, size_bytes=1, remote_folder_hint=None)
+
+    assert uploader._resolve_folder(file) == "Fallback"
+
+
+def test_resolve_folder_ignores_the_hint_when_mirroring_is_off():
+    settings = _settings()
+    settings.mirror_local_folder_structure = False
+    settings.target_folder = "Fallback"
+    uploader = WebApiUploader(settings)
+
+    file = PendingFile(path=r"C:\Clips\clip.mp4", kind=MediaKind.VIDEO, size_bytes=1, remote_folder_hint="SomeGame")
+
+    assert uploader._resolve_folder(file) == "Fallback"
+
+
+def test_chunked_upload_sends_the_resolved_folder_in_the_request(tmp_path):
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(b"x" * 10)
+
+    settings = _settings()
+    settings.mirror_local_folder_structure = True
+    uploader = WebApiUploader(settings)
+    file = PendingFile(path=str(path), kind=MediaKind.VIDEO, size_bytes=10, remote_folder_hint="SomeGame")
+
+    seen_folders = []
+    with patch.object(uploader, "_post_chunk", side_effect=lambda *args: seen_folders.append(args[6])):
+        uploader._upload_video_chunked(file)
+
+    assert seen_folders == ["SomeGame"]
+
+
+def test_image_upload_sends_the_resolved_folder_in_the_request(tmp_path, preserve_web_api_session_secret):
+    delete_secret(WEB_API_SESSION_COOKIES)
+    path = tmp_path / "shot.png"
+    path.write_bytes(b"x" * 10)
+
+    settings = _settings()
+    settings.mirror_local_folder_structure = True
+    uploader = WebApiUploader(settings)
+    file = PendingFile(path=str(path), kind=MediaKind.IMAGE, size_bytes=10, remote_folder_hint="SomeGame")
+
+    response = _mock_response({})
+    response.status_code = 201
+    with patch.object(uploader._session, "post", return_value=response) as mock_post:
+        uploader._upload_image(file)
+
+    assert mock_post.call_args.kwargs["data"]["folder"] == "SomeGame"
+
+
+def test_exists_at_destination_treats_same_name_in_a_different_folder_as_distinct(preserve_web_api_session_secret):
+    delete_secret(WEB_API_SESSION_COOKIES)
+    settings = _settings()
+    settings.mirror_local_folder_structure = True
+    uploader = WebApiUploader(settings)
+
+    login_response = _mock_response({})
+    # Same filename already exists, but under a different game's folder.
+    videos_response = _mock_response({"videos": [{"path": "OtherGame/clip.mp4", "extension": "mp4"}]})
+
+    file = PendingFile(path=r"C:\Clips\clip.mp4", kind=MediaKind.VIDEO, size_bytes=1, remote_folder_hint="SomeGame")
+
+    with patch.object(uploader._session, "post", return_value=login_response):
+        with patch.object(uploader._session, "get", return_value=videos_response):
+            found = uploader.exists_at_destination(file)
+
+    assert found is False
+
+
+def test_exists_at_destination_matches_same_name_in_the_same_folder(preserve_web_api_session_secret):
+    delete_secret(WEB_API_SESSION_COOKIES)
+    settings = _settings()
+    settings.mirror_local_folder_structure = True
+    uploader = WebApiUploader(settings)
+
+    login_response = _mock_response({})
+    videos_response = _mock_response({"videos": [{"path": "SomeGame/clip.mp4", "extension": "mp4"}]})
+
+    file = PendingFile(path=r"C:\Clips\clip.mp4", kind=MediaKind.VIDEO, size_bytes=1, remote_folder_hint="SomeGame")
+
+    with patch.object(uploader._session, "post", return_value=login_response):
+        with patch.object(uploader._session, "get", return_value=videos_response):
+            found = uploader.exists_at_destination(file)
+
+    assert found is True

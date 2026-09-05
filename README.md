@@ -25,6 +25,9 @@ instance.
 - After a successful upload, choose to leave the file in place, move it to a subfolder, or delete
   it.
 - Your Fireshare password is stored in Windows Credential Manager, never in the config file.
+- Checks GitHub Releases for a newer version on startup (configurable) and lets you update from
+  the tray menu with one click - it downloads the new build, verifies its checksum, and relaunches
+  itself automatically. Only active in the packaged build; a no-op when running from source.
 
 ## Requirements
 
@@ -58,6 +61,22 @@ required on the target machine). Run `dist\FireshareAgent\FireshareAgent.exe`.
 .\.venv\Scripts\python.exe -m pytest tests
 ```
 
+## Releases & versioning
+
+Versioning and releases are fully automatic - there's no manual tagging step:
+
+- Every push to `main` is analyzed by [python-semantic-release](https://python-semantic-release.readthedocs.io/)
+  against [Conventional Commits](https://www.conventionalcommits.org/), which decides the next
+  version and whether a release is even warranted. **Commit messages on `main` need to follow that
+  format** (`feat: ...`, `fix: ...`, `docs: ...`, a `BREAKING CHANGE:` footer or `!` for a major
+  bump, etc.) or a push won't trigger a release at all.
+- When a release is warranted, CI bumps `fireshare_agent/__init__.py`'s `__version__` and
+  `pyproject.toml`, generates a changelog, tags it, and publishes a GitHub Release - then builds
+  the Windows executable on a `windows-latest` runner and attaches the zipped build plus a
+  `.sha256` checksum file to that release. See `.github/workflows/release.yml`.
+- A plain `git push` with only non-release commits (or run from a branch other than `main`) is a
+  no-op for releases; `.github/workflows/ci.yml` still runs the test suite on every push and PR.
+
 ## Notes
 
 - Fireshare's chunked upload endpoint doesn't validate the checksum field against file content -
@@ -85,6 +104,12 @@ required on the target machine). Run `dist\FireshareAgent\FireshareAgent.exe`.
   the same in-progress group on the server instead of abandoning the chunks already sent (which
   Fireshare only cleans up on a successful reassembly or a server restart, otherwise leaving them
   on disk indefinitely).
+- The self-updater downloads the new build's zip and, if the release published a `.sha256`
+  alongside it, verifies the checksum before touching anything - a mismatch aborts with an error
+  and the currently-installed files are left untouched. Since a running exe can't overwrite its
+  own files, applying an update hands off to a small generated PowerShell script that waits for
+  this process to exit, mirrors the new files over the install directory, relaunches the app, and
+  deletes itself.
 
 ## License
 

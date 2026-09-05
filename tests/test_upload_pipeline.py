@@ -7,9 +7,10 @@ this would silently lose real recordings. Fixed by requeuing via a non-blocking 
 looping in place, with a generous 24h cap for a genuinely stuck file rather than a fixed attempt
 count.
 """
+import os
 import time
 
-from fireshare_agent.config.app_config import AppConfig
+from fireshare_agent.config.app_config import AppConfig, WatchFolderConfig
 from fireshare_agent.manifest.store import ManifestStore
 from fireshare_agent.pipeline import upload_pipeline
 from fireshare_agent.pipeline.activity import PipelineEventKind
@@ -98,3 +99,60 @@ def test_deleted_file_resolves_immediately(tmp_path):
     resolved = pipeline._process_candidate(str(missing))
 
     assert resolved is True
+
+
+def test_remote_folder_hint_uses_the_immediate_subfolder_name(tmp_path):
+    # Mirrors ShadowPlay's default layout: <capture root>/<game name>/<clip>.mp4
+    capture_root = tmp_path / "recordings"
+    game_dir = capture_root / "SomeGame"
+    game_dir.mkdir(parents=True)
+    clip = game_dir / "clip.mp4"
+    clip.write_bytes(b"x")
+
+    manifest = ManifestStore(str(tmp_path / "manifest.db"))
+    config = AppConfig(watch_folders=[WatchFolderConfig(path=str(capture_root))])
+    pipeline = UploadPipeline(manifest, config)
+
+    assert pipeline._compute_remote_folder_hint(str(clip)) == "SomeGame"
+
+
+def test_remote_folder_hint_is_none_for_a_file_directly_in_the_watch_root(tmp_path):
+    capture_root = tmp_path / "recordings"
+    capture_root.mkdir()
+    clip = capture_root / "clip.mp4"
+    clip.write_bytes(b"x")
+
+    manifest = ManifestStore(str(tmp_path / "manifest.db"))
+    config = AppConfig(watch_folders=[WatchFolderConfig(path=str(capture_root))])
+    pipeline = UploadPipeline(manifest, config)
+
+    assert pipeline._compute_remote_folder_hint(str(clip)) is None
+
+
+def test_remote_folder_hint_is_none_outside_any_watch_folder(tmp_path):
+    other_dir = tmp_path / "elsewhere"
+    other_dir.mkdir()
+    clip = other_dir / "clip.mp4"
+    clip.write_bytes(b"x")
+
+    manifest = ManifestStore(str(tmp_path / "manifest.db"))
+    config = AppConfig(watch_folders=[WatchFolderConfig(path=str(tmp_path / "recordings"))])
+    pipeline = UploadPipeline(manifest, config)
+
+    assert pipeline._compute_remote_folder_hint(str(clip)) is None
+
+
+def test_remote_folder_hint_normalizes_nested_paths_to_forward_slashes(tmp_path):
+    capture_root = tmp_path / "recordings"
+    nested_dir = capture_root / "Game" / "Highlights"
+    nested_dir.mkdir(parents=True)
+    clip = nested_dir / "clip.mp4"
+    clip.write_bytes(b"x")
+
+    manifest = ManifestStore(str(tmp_path / "manifest.db"))
+    config = AppConfig(watch_folders=[WatchFolderConfig(path=str(capture_root))])
+    pipeline = UploadPipeline(manifest, config)
+
+    hint = pipeline._compute_remote_folder_hint(str(clip))
+    assert hint == "Game/Highlights"
+    assert os.sep not in hint or os.sep == "/"

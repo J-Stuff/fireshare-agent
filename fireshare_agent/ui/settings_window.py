@@ -16,7 +16,7 @@ from typing import Callable
 
 import customtkinter as ctk
 
-from fireshare_agent import assets
+from fireshare_agent import __version__, assets
 from fireshare_agent.config.app_config import AppConfig, WatchFolderConfig
 from fireshare_agent.config.secrets import WEB_API_PASSWORD, set_secret
 from fireshare_agent.models import PostUploadAction
@@ -32,9 +32,16 @@ _POST_UPLOAD_BY_LABEL = {v: k for k, v in POST_UPLOAD_LABELS.items()}
 
 
 class SettingsWindow(ctk.CTkToplevel):
-    def __init__(self, parent: ctk.CTk, config: AppConfig, on_save: Callable[[AppConfig], None]) -> None:
+    def __init__(
+        self,
+        parent: ctk.CTk,
+        config: AppConfig,
+        on_save: Callable[[AppConfig], None],
+        on_check_for_updates: Callable[[], None] | None = None,
+    ) -> None:
         super().__init__(parent)
         self._on_save = on_save
+        self._on_check_for_updates = on_check_for_updates
         # Work on a deep copy so Cancel (closing without saving) never mutates live config.
         self._config = copy.deepcopy(config)
         self._watch_folders: list[WatchFolderConfig] = list(self._config.watch_folders)
@@ -173,11 +180,19 @@ class SettingsWindow(ctk.CTkToplevel):
         ).pack(anchor="w", pady=(6, 0))
 
         upload_body = widgets.section_card(tab, "Upload Options")
-        folder_row = widgets.labeled_row(upload_body, "Target folder:")
+
+        self._mirror_folders_var = ctk.BooleanVar(value=s.mirror_local_folder_structure)
+        ctk.CTkCheckBox(
+            upload_body, text="Mirror local subfolders as Fireshare folders (e.g. a per-game capture folder)",
+            variable=self._mirror_folders_var, font=widgets.body_font(),
+        ).pack(anchor="w", pady=(0, 8))
+
+        folder_row = widgets.labeled_row(upload_body, "Fallback folder:")
         self._webapi_folder_combo = ctk.CTkComboBox(folder_row, values=[s.target_folder] if s.target_folder else [""], font=widgets.body_font())
         self._webapi_folder_combo.set(s.target_folder)
         self._webapi_folder_combo.pack(side="left", fill="x", expand=True, padx=(0, 8))
         ctk.CTkButton(folder_row, text="Fetch Folders", width=110, command=self._fetch_web_api_folders).pack(side="left")
+        widgets.caption(upload_body, "Used for files that sit directly in a watch folder with no subfolder, or for everything if mirroring is off. Leave blank to use Fireshare's own default folder.").pack(anchor="w", pady=(2, 0))
 
         chunk_mb = max(1, s.chunk_size_bytes // (1024 * 1024))
         self._webapi_chunk_entry = widgets.labeled_entry(upload_body, "Chunk size (MB):", str(chunk_mb))
@@ -260,6 +275,15 @@ class SettingsWindow(ctk.CTkToplevel):
         data_body = widgets.section_card(tab, "Data", "Passwords are stored in Windows Credential Manager, never in the config file itself.")
         ctk.CTkButton(data_body, text="Open Config Folder", width=170, command=self._open_config_folder).pack(anchor="w")
 
+        updates_body = widgets.section_card(tab, "Updates", f"Currently running version {__version__}.")
+        self._auto_update_var = ctk.BooleanVar(value=self._config.auto_check_for_updates)
+        ctk.CTkCheckBox(updates_body, text="Automatically check for updates on startup", variable=self._auto_update_var, font=widgets.body_font()).pack(anchor="w", pady=(0, 8))
+        ctk.CTkButton(updates_body, text="Check for Updates Now", width=170, command=self._check_for_updates_now).pack(anchor="w")
+
+    def _check_for_updates_now(self) -> None:
+        if self._on_check_for_updates:
+            self._on_check_for_updates()
+
     def _open_config_folder(self) -> None:
         from fireshare_agent.config.store import app_data_dir
 
@@ -281,6 +305,7 @@ class SettingsWindow(ctk.CTkToplevel):
         config.web_api.base_url = self._webapi_url_entry.get().strip()
         config.web_api.username = self._webapi_username_entry.get().strip()
         config.web_api.ignore_certificate_errors = self._webapi_ignore_cert_var.get()
+        config.web_api.mirror_local_folder_structure = self._mirror_folders_var.get()
         config.web_api.target_folder = self._webapi_folder_combo.get().strip()
         config.web_api.chunk_size_bytes = _safe_int(self._webapi_chunk_entry.get(), 50) * 1024 * 1024
 
@@ -300,6 +325,7 @@ class SettingsWindow(ctk.CTkToplevel):
         config.retry_backoff_seconds = _safe_int(self._retry_backoff_entry.get(), 30)
         config.start_with_windows = self._start_with_windows_var.get()
         config.show_upload_notifications = self._notifications_var.get()
+        config.auto_check_for_updates = self._auto_update_var.get()
 
         return config
 

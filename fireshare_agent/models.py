@@ -21,6 +21,10 @@ class PendingFile:
     path: str
     kind: MediaKind
     size_bytes: int
+    # The file's subfolder relative to whichever configured watch folder contains it (e.g.
+    # "HELLDIVERS 2" for .../captures/HELLDIVERS 2/clip.mp4), forward-slash normalized. None if
+    # the file sits directly in the watch folder's root with no subfolder to mirror.
+    remote_folder_hint: str | None = None
 
 
 @dataclass(frozen=True)

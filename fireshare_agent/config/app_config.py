@@ -22,6 +22,12 @@ class WebApiSettings:
     ignore_certificate_errors: bool = False
     target_folder: str = ""
     chunk_size_bytes: int = 50 * 1024 * 1024
+    # When true, a file's Fireshare folder is taken from its local subfolder name relative to
+    # whichever watch folder contains it (e.g. ".../captures/HELLDIVERS 2/clip.mp4" -> folder
+    # "HELLDIVERS 2"), so ShadowPlay's per-game folder layout carries over instead of everything
+    # landing in one flat target_folder. target_folder is still used as the fallback for files
+    # that sit directly in a watch folder's root with no subfolder to mirror.
+    mirror_local_folder_structure: bool = True
     # password lives in Windows Credential Manager
 
 
@@ -41,6 +47,7 @@ class AppConfig:
 
     start_with_windows: bool = False
     show_upload_notifications: bool = True
+    auto_check_for_updates: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -59,4 +66,5 @@ class AppConfig:
         config.retry_backoff_seconds = data.get("retry_backoff_seconds", config.retry_backoff_seconds)
         config.start_with_windows = data.get("start_with_windows", config.start_with_windows)
         config.show_upload_notifications = data.get("show_upload_notifications", config.show_upload_notifications)
+        config.auto_check_for_updates = data.get("auto_check_for_updates", config.auto_check_for_updates)
         return config
