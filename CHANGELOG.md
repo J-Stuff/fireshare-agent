@@ -2,6 +2,35 @@
 
 <!-- version list -->
 
+## v1.2.0 (2026-09-05)
+
+### Bug Fixes
+
+- Add single-instance guard to prevent duplicate agents running
+  ([#5](https://github.com/J-Stuff/fireshare-agent/pull/5),
+  [`ffa0458`](https://github.com/J-Stuff/fireshare-agent/commit/ffa0458a9411e4e65a697aca282bb3b0fcb1f562))
+
+- Exclude post-upload subfolder from watching and rescans
+  ([#5](https://github.com/J-Stuff/fireshare-agent/pull/5),
+  [`ffa0458`](https://github.com/J-Stuff/fireshare-agent/commit/ffa0458a9411e4e65a697aca282bb3b0fcb1f562))
+
+- Make failed-upload retry backoff non-blocking
+  ([#5](https://github.com/J-Stuff/fireshare-agent/pull/5),
+  [`ffa0458`](https://github.com/J-Stuff/fireshare-agent/commit/ffa0458a9411e4e65a697aca282bb3b0fcb1f562))
+
+- Trigger release for installer packaging ([#5](https://github.com/J-Stuff/fireshare-agent/pull/5),
+  [`ffa0458`](https://github.com/J-Stuff/fireshare-agent/commit/ffa0458a9411e4e65a697aca282bb3b0fcb1f562))
+
+- Upload bugs regarding moved files, fail-retry backoff & multiple launched instances
+  ([#5](https://github.com/J-Stuff/fireshare-agent/pull/5),
+  [`ffa0458`](https://github.com/J-Stuff/fireshare-agent/commit/ffa0458a9411e4e65a697aca282bb3b0fcb1f562))
+
+### Features
+
+- Update settings menu visuals ([#5](https://github.com/J-Stuff/fireshare-agent/pull/5),
+  [`ffa0458`](https://github.com/J-Stuff/fireshare-agent/commit/ffa0458a9411e4e65a697aca282bb3b0fcb1f562))
+
+
 ## v1.1.0 (2026-09-05)
 
 ### Bug Fixes
