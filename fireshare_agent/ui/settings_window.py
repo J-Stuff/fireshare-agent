@@ -47,29 +47,45 @@ class SettingsWindow(ctk.CTkToplevel):
         self._watch_folders: list[WatchFolderConfig] = list(self._config.watch_folders)
 
         self.title("Fireshare Agent - Settings")
-        self.geometry("720x680")
-        self.minsize(640, 540)
+        self.geometry("940x680")
+        self.minsize(820, 540)
+        self.configure(fg_color=widgets.WINDOW_BG)
         assets.apply_window_icon(self)
 
         header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=24, pady=(20, 8))
+        header.pack(fill="x", padx=24, pady=(20, 12))
         ctk.CTkLabel(header, text="Settings", font=widgets.heading_font(20)).pack(anchor="w")
         ctk.CTkLabel(
             header, text="Choose what to watch and how captures get uploaded to Fireshare.",
             font=widgets.caption_font(), text_color=("gray40", "gray65"),
         ).pack(anchor="w", pady=(2, 0))
 
-        tabview = ctk.CTkTabview(self)
-        tabview.pack(fill="both", expand=True, padx=20, pady=(4, 4))
-        general_tab = tabview.add("General")
-        account_tab = tabview.add("Fireshare Account")
-        advanced_tab = tabview.add("Advanced")
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=20, pady=(0, 4))
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
 
-        self._build_general_tab(widgets.scrollable_tab(general_tab))
-        self._build_account_tab(widgets.scrollable_tab(account_tab))
-        self._build_advanced_tab(widgets.scrollable_tab(advanced_tab))
+        content = ctk.CTkFrame(body, fg_color="transparent")
+        content.grid(row=0, column=1, sticky="nsew")
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_rowconfigure(0, weight=1)
 
-        divider = ctk.CTkFrame(self, height=1, fg_color=("gray80", "gray25"))
+        general_page = widgets.scrollable_panel(content)
+        account_page = widgets.scrollable_panel(content)
+        advanced_page = widgets.scrollable_panel(content)
+
+        self._build_general_tab(general_page)
+        self._build_account_tab(account_page)
+        self._build_advanced_tab(advanced_page)
+
+        nav = widgets.SidebarNav(body, [
+            ("🗂", "General", general_page),
+            ("👤", "Fireshare Account", account_page),
+            ("⚙", "Advanced", advanced_page),
+        ])
+        nav.grid(row=0, column=0, sticky="ns", padx=(0, 16))
+
+        divider = ctk.CTkFrame(self, height=1, fg_color=("gray85", "gray22"))
         divider.pack(fill="x", padx=20, pady=(4, 0))
 
         button_bar = ctk.CTkFrame(self, fg_color="transparent")
@@ -87,8 +103,11 @@ class SettingsWindow(ctk.CTkToplevel):
     def _build_general_tab(self, tab) -> None:
         folders_body = widgets.section_card(tab, "Watch Folders", "Folders the agent watches for new ShadowPlay clips and screenshots.")
 
-        self._folders_frame = ctk.CTkScrollableFrame(folders_body, height=170, fg_color="transparent")
-        self._folders_frame.pack(fill="both", expand=False)
+        # A plain frame, not another CTkScrollableFrame: this whole page already scrolls, and
+        # nesting scrollable regions fights the mouse wheel over whose area is being scrolled.
+        # It sizes to however many folders there are instead of reserving dead space.
+        self._folders_frame = ctk.CTkFrame(folders_body, fg_color="transparent")
+        self._folders_frame.pack(fill="x")
         self._refresh_folder_rows()
 
         ctk.CTkButton(folders_body, text="+ Add Folder...", width=140, command=self._add_folder).pack(anchor="w", pady=(10, 0))
@@ -125,7 +144,7 @@ class SettingsWindow(ctk.CTkToplevel):
             widgets.caption(self._folders_frame, "No folders configured yet - add one below.").pack(anchor="w", pady=8)
 
         for index, wf in enumerate(self._watch_folders):
-            row = ctk.CTkFrame(self._folders_frame, corner_radius=8, fg_color=("gray95", "gray20"))
+            row = ctk.CTkFrame(self._folders_frame, corner_radius=8, fg_color=("gray93", "gray26"))
             row.pack(fill="x", pady=3, padx=2)
             row.grid_columnconfigure(0, weight=1)
 
