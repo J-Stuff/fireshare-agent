@@ -9,6 +9,7 @@ count.
 """
 import os
 import sqlite3
+import threading
 import time
 
 import pytest
@@ -660,3 +661,130 @@ def test_the_fingerprint_is_recomputed_when_the_file_grew_during_the_probe(tmp_p
 
     final_fp = fingerprint.compute(str(clip), clip.stat().st_size)
     assert pipeline._manifest.is_already_handled(final_fp) is True
+
+
+# --- Retry timers must not accumulate ---------------------------------------------------------
+#
+# _pending_retry_timers exists only so stop() can cancel what is still pending, but nothing used
+# to take entries back out of it. A single multi-hour "Record" session, rechecked every 15s while
+# it is still being written, left roughly 240 dead Timer objects behind per hour - each wrapping a
+# Thread - for as long as the agent stayed running.
+
+
+def _drain_queue(pipeline) -> list[str]:
+    drained = []
+    while not pipeline._queue.empty():
+        drained.append(pipeline._queue.get_nowait())
+    return drained
+
+
+def test_a_finished_timer_is_pruned_by_the_next_schedule(tmp_path):
+    pipeline = _pipeline(tmp_path)
+    try:
+        pipeline._schedule_requeue("first.mp4", 0.0)
+        pipeline._pending_retry_timers[0].join(timeout=5)
+
+        pipeline._schedule_requeue("second.mp4", 0.0)
+
+        with pipeline._pending_retry_timers_lock:
+            assert len(pipeline._pending_retry_timers) == 1
+    finally:
+        pipeline.stop()
+
+
+def test_a_long_running_recording_does_not_pile_up_dead_timers(tmp_path):
+    """The actual leak: one file that is still being written gets requeued over and over, and every
+    one of those timers used to be retained for the lifetime of the process."""
+    pipeline = _pipeline(tmp_path)
+    try:
+        for _ in range(50):
+            pipeline._schedule_requeue("recording.mp4", 0.0)
+            pipeline._pending_retry_timers[-1].join(timeout=5)
+
+        with pipeline._pending_retry_timers_lock:
+            # Only the most recent one, which was appended after the last prune.
+            assert len(pipeline._pending_retry_timers) == 1
+        assert len(_drain_queue(pipeline)) == 50  # every retry still actually happened
+    finally:
+        pipeline.stop()
+
+
+def test_still_pending_timers_are_kept_so_stop_can_cancel_them(tmp_path):
+    """Pruning must only ever drop timers that have already run. Dropping a live one would leave
+    stop() with no reference to cancel it by."""
+    pipeline = _pipeline(tmp_path)
+    try:
+        for i in range(5):
+            pipeline._schedule_requeue(f"clip{i}.mp4", 9999)
+
+        with pipeline._pending_retry_timers_lock:
+            pending = list(pipeline._pending_retry_timers)
+        assert len(pending) == 5
+    finally:
+        pipeline.stop()
+
+    assert all(timer.finished.is_set() for timer in pending)  # stop() reached every one
+    # stop() also puts its own None sentinel in to unblock the worker; nothing else should be there.
+    assert [item for item in _drain_queue(pipeline) if item is not None] == []
+
+
+def test_concurrent_scheduling_never_drops_a_live_timer(tmp_path, monkeypatch):
+    """A Timer that has not been start()ed yet reports is_alive() == False. So pruning on append is
+    only safe if nothing can observe the list between the append and the start - otherwise one
+    scheduler prunes another's brand-new timer and stop() can never cancel it.
+
+    The slow start widens that window from a few microseconds to something deterministic. Patching
+    threading.Timer itself is process-wide, but nothing else here builds one, and monkeypatch puts
+    it back."""
+
+    class _SlowStartTimer(threading.Timer):
+        def start(self) -> None:
+            time.sleep(0.02)
+            super().start()
+
+    monkeypatch.setattr(upload_pipeline.threading, "Timer", _SlowStartTimer)
+
+    pipeline = _pipeline(tmp_path)
+    schedulers = [
+        threading.Thread(target=pipeline._schedule_requeue, args=(f"clip{i}.mp4", 9999))
+        for i in range(8)
+    ]
+    try:
+        for thread in schedulers:
+            thread.start()
+        for thread in schedulers:
+            thread.join(timeout=10)
+
+        with pipeline._pending_retry_timers_lock:
+            assert len(pipeline._pending_retry_timers) == 8
+    finally:
+        pipeline.stop()
+
+
+def test_pruning_does_not_disturb_a_retry_that_is_still_waiting(tmp_path):
+    """The prune walks the list while a real retry is pending in it; that retry must still fire."""
+    pipeline = _pipeline(tmp_path)
+    try:
+        pipeline._schedule_requeue("slow.mp4", 0.3)
+        for _ in range(5):
+            pipeline._schedule_requeue("quick.mp4", 0.0)
+            pipeline._pending_retry_timers[-1].join(timeout=5)
+
+        with pipeline._pending_retry_timers_lock:
+            slow = next(t for t in pipeline._pending_retry_timers if t.args == ("slow.mp4",))
+        slow.join(timeout=5)
+
+        assert "slow.mp4" in _drain_queue(pipeline)
+    finally:
+        pipeline.stop()
+
+
+def test_scheduling_after_stop_adds_nothing(tmp_path):
+    """stop() clears the list; a late retry landing afterwards must not repopulate it."""
+    pipeline = _pipeline(tmp_path)
+    pipeline.stop()
+
+    pipeline._schedule_requeue("late.mp4", 9999)
+
+    with pipeline._pending_retry_timers_lock:
+        assert pipeline._pending_retry_timers == []

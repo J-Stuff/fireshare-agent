@@ -403,8 +403,19 @@ class UploadPipeline:
         timer = threading.Timer(max(0.0, delay_seconds), self._requeue, args=(path,))
         timer.daemon = True
         with self._pending_retry_timers_lock:
+            # The list exists only so stop() can cancel what is still pending, but nothing used to
+            # take entries back out of it: a multi-hour "Record" session rechecked every 15s left
+            # ~240 dead Timer objects (each wrapping a Thread) behind per hour. Dropping the
+            # finished ones here keeps it at roughly the number of genuinely pending retries, which
+            # is small enough that the O(n) scan never matters.
+            self._pending_retry_timers = [t for t in self._pending_retry_timers if t.is_alive()]
             self._pending_retry_timers.append(timer)
-        timer.start()
+            # Started while the lock is held, deliberately. An unstarted Timer reports
+            # is_alive() == False, so a timer appended before it was started could be pruned by a
+            # concurrent scheduler between the two steps - quietly losing the only reference
+            # stop() has to cancel it by. Starting here means no other holder of this lock can
+            # ever observe an entry in that not-yet-alive state.
+            timer.start()
 
     def _requeue(self, path: str) -> None:
         if not self._stop_event.is_set():
