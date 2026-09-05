@@ -45,6 +45,8 @@ class FireshareAgentApp:
         self.activity_window: ActivityWindow | None = None
         self.tray: TrayIcon | None = None
         self._update_info: updater.UpdateInfo | None = None
+        self._sync_thread: threading.Thread | None = None
+        self._sync_lock = threading.Lock()
 
     def run(self) -> None:
         self.pipeline.start()
@@ -56,12 +58,12 @@ class FireshareAgentApp:
             # that is a button the user just pressed rather than something happening on its own.
             log.info("Agent is paused; skipping the startup rescan.")
         else:
-            self.pipeline.sync_now()  # catches anything created while the app wasn't running
+            self._start_sync()  # catches anything created while the app wasn't running
 
         self.tray = TrayIcon(
             on_open_settings=lambda: self.run_on_ui_thread(self.open_settings),
             on_open_activity=lambda: self.run_on_ui_thread(self.open_activity),
-            on_sync_now=self.pipeline.sync_now,
+            on_sync_now=self._start_sync,
             on_toggle_pause=self._toggle_pause,
             is_paused=lambda: self.pipeline.is_paused,
             has_failures=lambda: self.pipeline.failed_count > 0,
@@ -81,6 +83,37 @@ class FireshareAgentApp:
 
     def run_on_ui_thread(self, func) -> None:
         self.root.after(0, func)
+
+    def _start_sync(self) -> None:
+        """Kicks off a full rescan on a short-lived daemon thread, ignoring the request if one is
+        already running.
+
+        Never inline. A rescan is a recursive os.walk of every watch folder, and both callers are
+        on threads that have to stay responsive: pystray dispatches menu items on a single
+        callback thread, so blocking there freezes the entire menu (Exit included), and at startup
+        this runs on the main thread before the tray icon even exists. Marshalling to the UI thread
+        instead would be no better - run_on_ui_thread() runs the work inside Tk's event loop, which
+        would just move the freeze onto the settings and activity windows."""
+        with self._sync_lock:
+            if self._sync_thread is not None and self._sync_thread.is_alive():
+                # Sync Now is a menu item the user can click repeatedly while a slow scan of a
+                # large library is still going. Each extra scan would be pure duplicated work -
+                # anything the running one has already queued is held in the pipeline's in-flight
+                # set, so a second walk would find the same files and discard them again.
+                log.info("A rescan is already in progress; ignoring this request.")
+                return
+            self._sync_thread = threading.Thread(
+                target=self._run_sync, daemon=True, name="fireshare-agent-sync",
+            )
+            self._sync_thread.start()
+
+    def _run_sync(self) -> None:
+        try:
+            self.pipeline.sync_now()
+        except Exception:
+            # Nothing above this frame would report it: this is the top of a bare worker thread,
+            # so an escaping error would only reach threading's default hook and be lost.
+            log.exception("Rescan failed.")
 
     def open_settings(self) -> None:
         if self.settings_window is not None and self.settings_window.winfo_exists():

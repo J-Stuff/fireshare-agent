@@ -195,8 +195,15 @@ class UploadPipeline:
         )
 
     def sync_now(self) -> None:
-        """Walks all watch folders now and enqueues anything not already recorded as uploaded."""
+        """Walks all watch folders now and enqueues anything not already recorded as uploaded.
+
+        Runs on a caller-supplied background thread (see FireshareAgentApp._start_sync), so it can
+        still be part-way through a large library when the user hits Exit. It bails out on the stop
+        event rather than churning the disk enqueueing work that the now-stopped worker will never
+        pick up."""
         for folder in self._config.watch_folders:
+            if self._stop_event.is_set():
+                return
             if not folder.path or not os.path.isdir(folder.path):
                 continue
 
@@ -209,6 +216,8 @@ class UploadPipeline:
                     walker = []
 
             for root, dirs, files in walker:
+                if self._stop_event.is_set():
+                    return
                 if folder.recursive:
                     # Prune the post-upload destination subfolder (at any depth, e.g. also under
                     # a mirrored per-game subfolder) so already-uploaded files that were moved
