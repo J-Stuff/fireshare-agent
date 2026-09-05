@@ -199,3 +199,151 @@ def test_apply_update_rejects_a_checksum_mismatch(tmp_path, monkeypatch):
                 updater.apply_update(_update_info(), on_exit=lambda: None)
 
     mock_popen.assert_not_called()  # never launched the installer on a bad checksum
+
+
+# --- The update is downloaded and then executed silently, elevated via UAC on an all-users -------
+# install. Verification on that path must fail closed, and nothing an attacker can name may reach
+# the filesystem as a path segment.
+
+
+def _info(**overrides) -> updater.UpdateInfo:
+    fields = dict(
+        version="1.3.0",
+        tag="v1.3.0",
+        download_url="https://example.invalid/FireshareAgentSetup.exe",
+        checksum_url="https://example.invalid/FireshareAgentSetup.exe.sha256",
+        notes_url="https://github.com/J-Stuff/fireshare-agent/releases/latest",
+    )
+    fields.update(overrides)
+    return updater.UpdateInfo(**fields)
+
+
+@pytest.fixture
+def staged(tmp_path, monkeypatch):
+    """Points the staging directory at a tmp_path and stubs the download to write known bytes,
+    returning the sha256 those bytes actually hash to."""
+    monkeypatch.setattr(updater, "app_data_dir", lambda: tmp_path)
+    payload = b"pretend installer"
+
+    def _fake_download(url, destination):
+        destination.write_bytes(payload)
+
+    monkeypatch.setattr(updater, "_download_file", _fake_download)
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _never_launch(*args, **kwargs):  # pragma: no cover - reaching this is the failure
+    raise AssertionError("the installer must not be launched")
+
+
+def test_a_release_with_no_checksum_is_refused(staged, monkeypatch):
+    """Used to install with no integrity check at all: verification was wrapped in
+    `if info.checksum_url:`, so a release that published no .sha256 asset simply skipped it."""
+    monkeypatch.setattr(updater.subprocess, "Popen", _never_launch)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        updater.apply_update(_info(checksum_url=None), on_exit=_never_launch)
+
+    assert "checksum" in str(excinfo.value).lower()
+    assert "releases" in str(excinfo.value).lower()  # points the user at a manual install
+
+
+@pytest.mark.parametrize(
+    "checksum_text",
+    [
+        "",                      # empty file - used to raise IndexError from .split()[0]
+        "   \n",                 # whitespace only
+        "not-a-digest",
+        "abc123",                # hex, but too short
+        "z" * 64,                # right length, not hex
+        "a" * 65,                # hex, but the wrong length for sha256
+        "a" * 63,
+    ],
+)
+def test_an_unusable_checksum_file_is_refused(staged, monkeypatch, checksum_text):
+    """`if expected and expected != actual` skipped the comparison entirely when the checksum file
+    was empty or malformed, because an empty string is falsy."""
+    monkeypatch.setattr(updater, "_download_text", lambda url: checksum_text)
+    monkeypatch.setattr(updater.subprocess, "Popen", _never_launch)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        updater.apply_update(_info(), on_exit=_never_launch)
+
+    assert "verified" in str(excinfo.value).lower()
+
+
+def test_a_mismatched_checksum_is_refused(staged, monkeypatch):
+    monkeypatch.setattr(updater, "_download_text", lambda url: "b" * 64)
+    monkeypatch.setattr(updater.subprocess, "Popen", _never_launch)
+
+    with pytest.raises(RuntimeError):
+        updater.apply_update(_info(), on_exit=_never_launch)
+
+
+def test_a_matching_checksum_launches_the_installer(staged, monkeypatch):
+    """The positive case, so the fail-closed changes cannot pass by refusing everything."""
+    monkeypatch.setattr(updater, "_download_text", lambda url: f"{staged}  FireshareAgentSetup.exe\n")
+    launched, exited = [], []
+    monkeypatch.setattr(updater.subprocess, "Popen", lambda cmd, **kw: launched.append(cmd))
+
+    updater.apply_update(_info(), on_exit=lambda: exited.append(True))
+
+    assert len(launched) == 1
+    assert launched[0][0].endswith("FireshareAgentSetup.exe")
+    assert "/VERYSILENT" in launched[0]
+    assert exited == [True]
+
+
+def test_an_uppercase_checksum_still_matches(staged, monkeypatch):
+    """Plenty of tools emit uppercase hex; normalising is not the same as failing open."""
+    monkeypatch.setattr(updater, "_download_text", lambda url: staged.upper())
+    launched = []
+    monkeypatch.setattr(updater.subprocess, "Popen", lambda cmd, **kw: launched.append(cmd))
+
+    updater.apply_update(_info(), on_exit=lambda: None)
+
+    assert len(launched) == 1
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    ["..", ".", "../evil", "..\\evil", "a/b", "a\\b", "C:evil", "", "has space", "semi;colon"],
+)
+def test_an_unsafe_release_name_never_reaches_the_filesystem(staged, monkeypatch, unsafe):
+    """info.version is the release tag with a leading `v` stripped and nothing else validated, and
+    it is used directly as a directory name under %AppData%."""
+    monkeypatch.setattr(updater, "_download_text", lambda url: staged)
+    monkeypatch.setattr(updater.subprocess, "Popen", _never_launch)
+
+    with pytest.raises(RuntimeError):
+        updater.apply_update(_info(version=unsafe), on_exit=_never_launch)
+
+
+def test_a_rejected_release_name_creates_no_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(updater, "app_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(updater.subprocess, "Popen", _never_launch)
+
+    with pytest.raises(RuntimeError):
+        updater.apply_update(_info(version="../evil"), on_exit=_never_launch)
+
+    assert list(tmp_path.rglob("evil")) == []
+
+
+@pytest.mark.parametrize("safe", ["1.3.0", "1.3.0-rc.1", "2026.09.06", "v_1-3-0"])
+def test_ordinary_release_names_are_accepted(safe):
+    assert updater._is_safe_path_segment(safe) is True
+
+
+def test_a_hostile_tag_is_dropped_at_check_time(monkeypatch):
+    """Rejected during the check as well, so a malformed release never surfaces as an offer the
+    user can click in the first place."""
+    monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
+    response = MagicMock()
+    response.json.return_value = {
+        "tag_name": "v../../evil",
+        "assets": [{"name": "Setup.exe", "browser_download_url": "https://example.invalid/s.exe"}],
+        "html_url": "https://example.invalid/releases",
+    }
+    monkeypatch.setattr(updater.requests, "get", lambda *a, **k: response)
+
+    assert updater.check_for_update() is None

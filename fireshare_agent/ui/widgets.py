@@ -1,6 +1,8 @@
 """Small reusable building blocks so every settings tab shares the same look and spacing."""
 from __future__ import annotations
 
+import webbrowser
+
 import customtkinter as ctk
 
 from fireshare_agent.config.secrets import get_secret
@@ -11,6 +13,8 @@ _SAVED_PLACEHOLDER = "(unchanged - already saved)"
 _COLOR_SUCCESS = ("#1a8754", "#3ddc84")
 _COLOR_ERROR = ("#d1453b", "#ff7b72")
 _COLOR_MUTED = ("gray40", "gray65")
+_COLOR_WARNING = ("#9a6700", "#e3b341")
+_COLOR_LINK = ("#0b5cad", "#69b7ff")
 
 _STATUS_ICON = {"info": "⏳", "success": "✓", "error": "✕"}
 _STATUS_COLOR = {"info": _COLOR_MUTED, "success": _COLOR_SUCCESS, "error": _COLOR_ERROR}
@@ -168,6 +172,32 @@ def labeled_password(parent, label_text: str, secret_key: str, label_width: int 
     field = PasswordField(row, secret_key, placeholder)
     field.pack(side="left", fill="x", expand=True)
     return field
+
+
+class LinkLabel(ctk.CTkFrame):
+    """A wrapped warning message with a clickable link underneath it. Kept as a frame of two labels
+    rather than one label with embedded markup, because CTkLabel has no rich-text support - the link
+    needs its own colour, cursor, and click binding."""
+
+    def __init__(self, parent, text: str, url: str, link_text: str) -> None:
+        super().__init__(parent, fg_color="transparent")
+        self._url = url
+
+        self._message = ctk.CTkLabel(
+            self, text=text, font=caption_font(), text_color=_COLOR_WARNING,
+            anchor="w", justify="left", wraplength=560,
+        )
+        self._message.pack(anchor="w")
+
+        self._link = ctk.CTkLabel(
+            self, text=link_text, font=caption_font(), text_color=_COLOR_LINK,
+            anchor="w", cursor="hand2",
+        )
+        self._link.pack(anchor="w")
+        self._link.bind("<Button-1>", lambda _e: webbrowser.open(self._url))
+
+    def set_text(self, text: str) -> None:
+        self._message.configure(text=text)
 
 
 def set_status(label: ctk.CTkLabel, kind: str, message: str) -> None:

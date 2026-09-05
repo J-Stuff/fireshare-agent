@@ -1,4 +1,20 @@
+import sqlite3
+
 from fireshare_agent.manifest.store import ManifestStore
+
+# The exact schema shipped before the review queue existed. Kept verbatim so the in-place upgrade
+# path is tested against what is actually on an existing user's disk, not against a paraphrase.
+_PRE_REVIEW_SCHEMA = """
+CREATE TABLE IF NOT EXISTS uploads (
+    fingerprint TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    updated_at_utc TEXT NOT NULL,
+    method TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error TEXT
+);
+"""
 
 
 def test_unknown_fingerprint_is_not_handled(tmp_path):
@@ -37,3 +53,104 @@ def test_get_recent_orders_newest_first(tmp_path):
 
     recent = store.get_recent()
     assert [e.fingerprint for e in recent] == ["fp2", "fp1"]
+
+
+def test_pending_review_round_trip(tmp_path):
+    store = ManifestStore(str(tmp_path / "manifest.db"))
+    store.record_already_existed("fp1", r"C:\clip.mp4", 1234, "web_api", pending_review=True)
+
+    pending = store.get_pending_review()
+    assert [e.fingerprint for e in pending] == ["fp1"]
+    assert pending[0].pending_review is True
+    assert store.get_pending_review_count() == 1
+    # Awaiting review is still "handled" - it must not be re-uploaded in the meantime.
+    assert store.is_already_handled("fp1") is True
+
+    store.clear_pending_review("fp1")
+
+    assert store.get_pending_review() == []
+    assert store.get_pending_review_count() == 0
+    assert store.is_already_handled("fp1") is True  # the dedupe record itself survives
+
+
+def test_already_existed_does_not_queue_for_review_by_default(tmp_path):
+    store = ManifestStore(str(tmp_path / "manifest.db"))
+    store.record_already_existed("fp1", r"C:\clip.mp4", 1234, "web_api")
+
+    assert store.get_pending_review_count() == 0
+
+
+def test_opens_a_database_written_before_the_review_column_existed(tmp_path):
+    # An agent upgraded in place meets a table that already exists, so CREATE TABLE IF NOT EXISTS
+    # is a no-op and will not add the new column - every query mentioning it would fail with
+    # "no such column" until the additive migration runs.
+    db_path = tmp_path / "manifest.db"
+    conn = sqlite3.connect(str(db_path))
+    with conn:
+        conn.executescript(_PRE_REVIEW_SCHEMA)
+        conn.execute(
+            "INSERT INTO uploads VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("fp1", r"C:\old_clip.mp4", 99, "2026-01-01T00:00:00+00:00", "web_api", "success", None),
+        )
+    conn.close()
+
+    store = ManifestStore(str(db_path))
+
+    assert store.is_already_handled("fp1") is True  # pre-existing history survives the upgrade
+    assert store.get_pending_review_count() == 0
+    assert store.get_recent()[0].pending_review is False
+
+
+def test_migration_is_idempotent(tmp_path):
+    db_path = tmp_path / "manifest.db"
+    ManifestStore(str(db_path))
+    store = ManifestStore(str(db_path))  # second open must not try to re-add the column
+
+    store.record_already_existed("fp1", r"C:\clip.mp4", 1, "web_api", pending_review=True)
+    assert store.get_pending_review_count() == 1
+
+
+def test_pause_state_defaults_to_not_paused(tmp_path):
+    store = ManifestStore(str(tmp_path / "manifest.db"))
+    assert store.is_watching_paused() is False
+
+
+def test_pause_state_round_trips_through_a_reopen(tmp_path):
+    db_path = str(tmp_path / "manifest.db")
+    ManifestStore(db_path).set_watching_paused(True)
+
+    assert ManifestStore(db_path).is_watching_paused() is True
+
+
+def test_pause_state_can_be_cleared(tmp_path):
+    db_path = str(tmp_path / "manifest.db")
+    store = ManifestStore(db_path)
+    store.set_watching_paused(True)
+    store.set_watching_paused(False)
+
+    assert ManifestStore(db_path).is_watching_paused() is False
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute("SELECT COUNT(*) FROM agent_state").fetchone()
+    assert rows[0] == 1  # upserted in place rather than accumulating a row per toggle
+
+
+def test_agent_state_table_is_created_in_a_database_that_predates_it(tmp_path):
+    # agent_state arrived after the review column, so an existing user's database has neither.
+    # A new *table* needs no _migrate() entry - unlike ALTER TABLE, CREATE TABLE IF NOT EXISTS
+    # really does apply to an already-populated database - and this pins that.
+    db_path = tmp_path / "manifest.db"
+    conn = sqlite3.connect(str(db_path))
+    with conn:
+        conn.executescript(_PRE_REVIEW_SCHEMA)
+        conn.execute(
+            "INSERT INTO uploads VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("fp1", r"C:\old_clip.mp4", 99, "2026-01-01T00:00:00+00:00", "web_api", "success", None),
+        )
+    conn.close()
+
+    store = ManifestStore(str(db_path))
+
+    assert store.is_watching_paused() is False
+    store.set_watching_paused(True)
+    assert store.is_watching_paused() is True
+    assert store.is_already_handled("fp1") is True  # upgrade did not disturb existing history

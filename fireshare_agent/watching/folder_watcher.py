@@ -111,7 +111,15 @@ class FolderWatcherService:
         if scheduled_any:
             observer.start()
             self._observer = observer
-        self._paused = False
+
+        # Deliberately does NOT touch self._paused. This method has two callers with two
+        # different intents: UploadPipeline.start() brings the service up at boot, and
+        # UploadPipeline.update_config() calls it purely to re-apply the watch list after the
+        # user saves Settings. It used to end with `self._paused = False`, which is right for
+        # the first and wrong for the second - a paused agent silently resumed watching on any
+        # Settings save, while the tray icon stayed desaturated and the menu kept offering
+        # "Resume Watching". Pause is now owned entirely by pause()/resume() and restored from
+        # the manifest by UploadPipeline, so start() is a pure "(re)apply these watches".
 
     def pause(self) -> None:
         self._paused = True

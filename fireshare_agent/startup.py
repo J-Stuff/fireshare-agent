@@ -29,9 +29,17 @@ def set_enabled(enabled: bool) -> None:
 
 
 def is_enabled() -> bool:
+    """Whether the Run entry is actually present right now.
+
+    The saved config is not evidence: the entry can be removed behind the app's back by a cleanup
+    utility, another startup manager, or a manual regedit, and the config would go on claiming the
+    app starts with Windows. Catches OSError rather than FileNotFoundError - a missing key and a
+    missing value both raise the latter, but a permissions problem reading HKCU raises a plain
+    OSError, and this is called to render a checkbox, where "cannot tell" is far better expressed
+    as "not enabled" than as a traceback out of the settings window."""
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0, winreg.KEY_READ) as key:
             winreg.QueryValueEx(key, _VALUE_NAME)
             return True
-    except FileNotFoundError:
+    except OSError:
         return False

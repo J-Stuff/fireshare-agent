@@ -5,6 +5,7 @@ import logging
 import sys
 import threading
 import tkinter.messagebox as messagebox
+from enum import Enum
 
 import customtkinter as ctk
 
@@ -20,6 +21,44 @@ from fireshare_agent.ui.settings_window import SettingsWindow
 from fireshare_agent.ui.tray import TrayIcon
 
 log = logging.getLogger(__name__)
+
+
+class UpdateCheckResponse(Enum):
+    """What the user should be shown after an update check. Split out from the code that shows it
+    so the decision can be tested without a UI - `_on_update_check_result` is otherwise pure
+    dispatch into modal dialogs and tray balloons."""
+
+    OFFER_UPDATE = "offer_update"      # jump straight to the confirm-and-install dialog
+    ANNOUNCE_UPDATE = "announce_update"  # unobtrusive tray balloon
+    ALREADY_CURRENT = "already_current"  # modal "you are up to date"
+    NOTHING = "nothing"
+
+
+def decide_update_check_response(
+    update_available: bool, user_initiated: bool, announce_automatic_updates: bool,
+) -> UpdateCheckResponse:
+    """A check the user explicitly asked for is owed a definite answer in *both* directions.
+
+    The old shape got this backwards. "No update" - the less interesting outcome - got a modal
+    window, while "update available" got only a transient tray balloon, and that balloon was gated
+    on `show_upload_notifications`, the per-upload notification toggle. Turning that off is entirely
+    reasonable for a background uploader, and it meant a manual check with an update waiting
+    produced no feedback of any kind: click the button, nothing happens.
+
+    So a user-initiated check with an update available now goes straight to the confirm dialog. The
+    user asked about updates, there is one, and that dialog already names the version and explains
+    what will happen - which collapses "read balloon, find the tray icon, open the menu, click
+    update" into a single click. It also sidesteps the balloon's other problem: it said "see the
+    tray menu", but a manual check is launched from Settings > Advanced, so the window the user is
+    looking at is very likely covering the tray icon it points them at.
+
+    The automatic startup check keeps the balloon - a modal on launch would be an ambush - but gated
+    on a flag that actually means "tell me about updates"."""
+    if update_available:
+        if user_initiated:
+            return UpdateCheckResponse.OFFER_UPDATE
+        return UpdateCheckResponse.ANNOUNCE_UPDATE if announce_automatic_updates else UpdateCheckResponse.NOTHING
+    return UpdateCheckResponse.ALREADY_CURRENT if user_initiated else UpdateCheckResponse.NOTHING
 
 
 class FireshareAgentApp:
@@ -45,15 +84,25 @@ class FireshareAgentApp:
         self.activity_window: ActivityWindow | None = None
         self.tray: TrayIcon | None = None
         self._update_info: updater.UpdateInfo | None = None
+        self._sync_thread: threading.Thread | None = None
+        self._sync_lock = threading.Lock()
 
     def run(self) -> None:
         self.pipeline.start()
-        self.pipeline.sync_now()  # catches anything created while the app wasn't running
+        if self.pipeline.is_paused:
+            # Pause now survives a restart, which makes this rescan newly dangerous: a paused
+            # agent would come back up and immediately upload everything it found sitting in the
+            # watch folders - exactly what the user paused it to stop. Pause suppresses automatic
+            # work; the manual "Sync Now" menu item is deliberately still allowed to run, since
+            # that is a button the user just pressed rather than something happening on its own.
+            log.info("Agent is paused; skipping the startup rescan.")
+        else:
+            self._start_sync()  # catches anything created while the app wasn't running
 
         self.tray = TrayIcon(
             on_open_settings=lambda: self.run_on_ui_thread(self.open_settings),
             on_open_activity=lambda: self.run_on_ui_thread(self.open_activity),
-            on_sync_now=self.pipeline.sync_now,
+            on_sync_now=self._start_sync,
             on_toggle_pause=self._toggle_pause,
             is_paused=lambda: self.pipeline.is_paused,
             has_failures=lambda: self.pipeline.failed_count > 0,
@@ -61,6 +110,7 @@ class FireshareAgentApp:
             has_update=lambda: self._update_info is not None,
             update_version=lambda: self._update_info.version if self._update_info else "",
             on_update_now=lambda: self.run_on_ui_thread(self.confirm_and_apply_update),
+            pending_review_count=lambda: self.pipeline.pending_review_count,
         )
         tray_thread = threading.Thread(target=self.tray.run, daemon=True, name="fireshare-agent-tray")
         tray_thread.start()
@@ -72,6 +122,37 @@ class FireshareAgentApp:
 
     def run_on_ui_thread(self, func) -> None:
         self.root.after(0, func)
+
+    def _start_sync(self) -> None:
+        """Kicks off a full rescan on a short-lived daemon thread, ignoring the request if one is
+        already running.
+
+        Never inline. A rescan is a recursive os.walk of every watch folder, and both callers are
+        on threads that have to stay responsive: pystray dispatches menu items on a single
+        callback thread, so blocking there freezes the entire menu (Exit included), and at startup
+        this runs on the main thread before the tray icon even exists. Marshalling to the UI thread
+        instead would be no better - run_on_ui_thread() runs the work inside Tk's event loop, which
+        would just move the freeze onto the settings and activity windows."""
+        with self._sync_lock:
+            if self._sync_thread is not None and self._sync_thread.is_alive():
+                # Sync Now is a menu item the user can click repeatedly while a slow scan of a
+                # large library is still going. Each extra scan would be pure duplicated work -
+                # anything the running one has already queued is held in the pipeline's in-flight
+                # set, so a second walk would find the same files and discard them again.
+                log.info("A rescan is already in progress; ignoring this request.")
+                return
+            self._sync_thread = threading.Thread(
+                target=self._run_sync, daemon=True, name="fireshare-agent-sync",
+            )
+            self._sync_thread.start()
+
+    def _run_sync(self) -> None:
+        try:
+            self.pipeline.sync_now()
+        except Exception:
+            # Nothing above this frame would report it: this is the top of a bare worker thread,
+            # so an escaping error would only reach threading's default hook and be lost.
+            log.exception("Rescan failed.")
 
     def open_settings(self) -> None:
         if self.settings_window is not None and self.settings_window.winfo_exists():
@@ -89,12 +170,17 @@ class FireshareAgentApp:
             self.activity_window.lift()
             self.activity_window.focus_force()
             return
-        self.activity_window = ActivityWindow(self.root, self.manifest)
+        self.activity_window = ActivityWindow(self.root, self.manifest, self.pipeline)
 
     def _on_settings_saved(self, new_config: AppConfig) -> None:
         self.config = new_config
         config_store.save(new_config)
         self.pipeline.update_config(new_config)
+        # The icon and menu labels are rendered from live callbacks (pause state, failure count,
+        # pending-review count), and nothing else on this path pokes them. Refresh unconditionally
+        # so the tray can never keep asserting a state the pipeline has moved on from.
+        if self.tray:
+            self.tray.refresh()
         log.info("Settings saved; watcher and uploader reconfigured.")
 
     def _toggle_pause(self) -> None:
@@ -119,10 +205,21 @@ class FireshareAgentApp:
         if self.tray:
             self.tray.refresh()
 
-        if info is not None:
-            if self.config.show_upload_notifications:
-                self._notify(f"Fireshare Agent {info.version} is available - see the tray menu to update.")
-        elif notify_if_none:
+        # notify_if_none is really "the user pressed the button", which now governs both branches
+        # rather than only the no-update one.
+        response = decide_update_check_response(
+            update_available=info is not None,
+            user_initiated=notify_if_none,
+            # Someone who turned automatic checks on has already said they want to hear about
+            # updates; the per-upload notification toggle says nothing about that.
+            announce_automatic_updates=self.config.auto_check_for_updates,
+        )
+
+        if response == UpdateCheckResponse.OFFER_UPDATE:
+            self.confirm_and_apply_update()
+        elif response == UpdateCheckResponse.ANNOUNCE_UPDATE and info is not None:
+            self._notify(f"Fireshare Agent {info.version} is available - see the tray menu to update.")
+        elif response == UpdateCheckResponse.ALREADY_CURRENT:
             messagebox.showinfo("Fireshare Agent", f"You're already on the latest version ({__version__}).")
 
     def confirm_and_apply_update(self) -> None:
@@ -164,14 +261,19 @@ class FireshareAgentApp:
         level = logging.DEBUG if activity.event_kind == PipelineEventKind.WAITING else logging.INFO
         log.log(level, "%s: %s%s", activity.event_kind.value, activity.path, f" ({activity.message})" if activity.message else "")
 
-        if self.tray and activity.event_kind in (PipelineEventKind.SUCCEEDED, PipelineEventKind.FAILED):
+        if self.tray and activity.event_kind in (
+            PipelineEventKind.SUCCEEDED, PipelineEventKind.FAILED, PipelineEventKind.ALREADY_AT_DESTINATION,
+        ):
             self.run_on_ui_thread(self.tray.refresh)
 
         if self.config.show_upload_notifications and self.tray:
             if activity.event_kind == PipelineEventKind.SUCCEEDED:
                 self._notify(f"Uploaded {_short_name(activity.path)}")
             elif activity.event_kind == PipelineEventKind.ALREADY_AT_DESTINATION:
-                self._notify(f"Already on Fireshare, skipped: {_short_name(activity.path)}")
+                self._notify(
+                    f"Already on Fireshare: {_short_name(activity.path)} - open the tray menu to "
+                    "review what happens to the local copy."
+                )
             elif activity.event_kind == PipelineEventKind.FAILED:
                 self._notify(f"Failed to upload {_short_name(activity.path)}: {activity.message}")
 
@@ -180,7 +282,10 @@ class FireshareAgentApp:
             if self.tray:
                 self.tray.icon.notify(message, title="Fireshare Agent")
         except Exception:
-            pass  # notifications are a nicety, never worth crashing the pipeline over
+            # Still swallowed - a balloon is never worth crashing the pipeline over - but recorded,
+            # so "the notification never appeared" is diagnosable rather than indistinguishable from
+            # "the notification was never attempted".
+            log.debug("Could not show a tray notification: %s", message, exc_info=True)
 
     def exit_app(self) -> None:
         log.info("Shutting down.")

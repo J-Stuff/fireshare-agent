@@ -17,10 +17,21 @@ from typing import Callable
 import customtkinter as ctk
 
 from fireshare_agent import __version__, assets
-from fireshare_agent.config.app_config import AppConfig, WatchFolderConfig
-from fireshare_agent.config.secrets import WEB_API_PASSWORD, set_secret
+from fireshare_agent.config.app_config import (
+    CHUNK_SIZE_MB_MAX,
+    CHUNK_SIZE_MB_MIN,
+    MAX_RETRY_ATTEMPTS_MAX,
+    MAX_RETRY_ATTEMPTS_MIN,
+    RETRY_BACKOFF_MAX_SECONDS,
+    RETRY_BACKOFF_MIN_SECONDS,
+    AppConfig,
+    WatchFolderConfig,
+    clamp,
+)
+from fireshare_agent.config.secrets import WEB_API_PASSWORD, delete_secret, get_secret, set_secret
 from fireshare_agent.models import PostUploadAction
 from fireshare_agent.ui import mfa_dialog, widgets
+from fireshare_agent.uploaders import cloudflare
 from fireshare_agent.uploaders.web_api_uploader import WebApiUploader, clear_persisted_web_api_session
 
 POST_UPLOAD_LABELS = {
@@ -45,6 +56,9 @@ class SettingsWindow(ctk.CTkToplevel):
         # Work on a deep copy so Cancel (closing without saving) never mutates live config.
         self._config = copy.deepcopy(config)
         self._watch_folders: list[WatchFolderConfig] = list(self._config.watch_folders)
+        # base_url -> is-behind-Cloudflare, for definite answers only. Avoids re-probing the
+        # same server on every focus change.
+        self._cloudflare_by_url: dict[str, bool] = {}
 
         self.title("Fireshare Agent - Settings")
         self.geometry("940x680")
@@ -215,7 +229,22 @@ class SettingsWindow(ctk.CTkToplevel):
 
         chunk_mb = max(1, s.chunk_size_bytes // (1024 * 1024))
         self._webapi_chunk_entry = widgets.labeled_entry(upload_body, "Chunk size (MB):", str(chunk_mb))
-        widgets.caption(upload_body, "Keep this well under 100MB if your Fireshare instance is behind Cloudflare.").pack(anchor="w", pady=(2, 0))
+        # Re-checked when the user leaves the field rather than on every keystroke: the probe is a
+        # network round trip, and a half-typed "1" on the way to "150" is not worth warning about.
+        self._webapi_chunk_entry.bind("<FocusOut>", lambda _e: self._check_cloudflare_chunk_limit())
+        self._webapi_url_entry.bind("<FocusOut>", lambda _e: self._check_cloudflare_chunk_limit())
+
+        self._cloudflare_warning = widgets.LinkLabel(
+            upload_body,
+            text="",
+            url=cloudflare.UPLOAD_LIMITS_DOC_URL,
+            link_text="Read Cloudflare's upload limits",
+        )
+        widgets.caption(
+            upload_body,
+            f"{CHUNK_SIZE_MB_MIN}-{CHUNK_SIZE_MB_MAX} MB. Keep this well under 100MB if your "
+            "Fireshare instance is behind Cloudflare.",
+        ).pack(anchor="w", pady=(2, 0))
 
         test_row = ctk.CTkFrame(tab, fg_color="transparent")
         test_row.pack(fill="x", pady=(0, 4))
@@ -223,10 +252,14 @@ class SettingsWindow(ctk.CTkToplevel):
         self._connection_status_label = ctk.CTkLabel(test_row, text="", anchor="w", font=widgets.caption_font())
         self._connection_status_label.pack(side="left", padx=10, fill="x", expand=True)
 
+        self._check_cloudflare_chunk_limit()
+
     def _test_web_api_connection(self) -> None:
         widgets.set_status(self._connection_status_label, "info", "Testing...")
         # persist_secrets=True: a freshly typed password must be usable immediately, not only
-        # after Save + reopening Settings.
+        # after Save + reopening Settings - and the MFA follow-up inside test_connection() reads
+        # the password back out of Credential Manager, so it has to be there before the call.
+        previous_password = get_secret(WEB_API_PASSWORD)
         working_config = self._build_config_from_fields(persist_secrets=True)
 
         def worker() -> None:
@@ -234,14 +267,18 @@ class SettingsWindow(ctk.CTkToplevel):
                 uploader = WebApiUploader(working_config.web_api, mfa_code_provider=self._prompt_for_mfa_code)
                 result = uploader.test_connection()
             except Exception as ex:  # a bad field value shouldn't crash the settings window
+                _keep_password_only_if_confirmed(previous_password, confirmed=False)
                 self.after(0, lambda: widgets.set_status(self._connection_status_label, "error", str(ex)))
                 return
+            _keep_password_only_if_confirmed(previous_password, confirmed=result.success)
             self.after(0, lambda: widgets.set_status(self._connection_status_label, "success" if result.success else "error", result.message))
+            self.after(0, self._check_cloudflare_chunk_limit)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _fetch_web_api_folders(self) -> None:
         # persist_secrets=True for the same reason as _test_web_api_connection above.
+        previous_password = get_secret(WEB_API_PASSWORD)
         working_config = self._build_config_from_fields(persist_secrets=True)
         widgets.set_status(self._connection_status_label, "info", "Fetching folders...")
 
@@ -250,8 +287,10 @@ class SettingsWindow(ctk.CTkToplevel):
                 uploader = WebApiUploader(working_config.web_api, mfa_code_provider=self._prompt_for_mfa_code)
                 folders = uploader.list_upload_folders()
             except Exception as ex:
+                _keep_password_only_if_confirmed(previous_password, confirmed=False)
                 self.after(0, lambda: widgets.set_status(self._connection_status_label, "error", f"Could not fetch folders: {ex}"))
                 return
+            _keep_password_only_if_confirmed(previous_password, confirmed=True)
 
             if folders:
                 self.after(0, lambda: self._webapi_folder_combo.configure(values=folders))
@@ -260,6 +299,59 @@ class SettingsWindow(ctk.CTkToplevel):
                 self.after(0, lambda: widgets.set_status(self._connection_status_label, "info", "Logged in, but the server returned no folders."))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    # ------------------------------------------------------- Cloudflare chunk check
+
+    def _check_cloudflare_chunk_limit(self) -> None:
+        """Warns when the configured chunk size would exceed what Cloudflare will proxy, but only
+        once we actually know Cloudflare is in front of this server. Cheap paths first: if the
+        chunk size is already safe, or the answer for this URL is cached, no network call happens
+        at all - this runs on every focus change out of the URL and chunk fields."""
+        chunk_mb = _safe_int(self._webapi_chunk_entry.get(), 50)
+        base_url = self._webapi_url_entry.get().strip()
+
+        if chunk_mb <= cloudflare.SAFE_CHUNK_MB or not base_url:
+            self._hide_cloudflare_warning()
+            return
+
+        cached = self._cloudflare_by_url.get(base_url)
+        if cached is not None:
+            self._render_cloudflare_warning(cached, chunk_mb)
+            return
+
+        verify = not self._webapi_ignore_cert_var.get()
+
+        def worker() -> None:
+            detected = cloudflare.is_behind_cloudflare(base_url, verify=verify)
+            self.after(0, lambda: self._on_cloudflare_probe_result(base_url, detected))
+
+        threading.Thread(target=worker, daemon=True, name="fireshare-agent-cloudflare-probe").start()
+
+    def _on_cloudflare_probe_result(self, base_url: str, detected: bool | None) -> None:
+        if not self.winfo_exists():
+            return  # window closed while the probe was in flight
+        if detected is not None:
+            # Only a definite answer is cached. "Could not determine" (offline, server down) must
+            # be re-probed later rather than remembered as "not behind Cloudflare".
+            self._cloudflare_by_url[base_url] = detected
+        if base_url != self._webapi_url_entry.get().strip():
+            return  # the user has moved on to a different server since this probe started
+        self._render_cloudflare_warning(bool(detected), _safe_int(self._webapi_chunk_entry.get(), 50))
+
+    def _render_cloudflare_warning(self, behind_cloudflare: bool, chunk_mb: int) -> None:
+        if not behind_cloudflare or chunk_mb <= cloudflare.SAFE_CHUNK_MB:
+            self._hide_cloudflare_warning()
+            return
+
+        self._cloudflare_warning.set_text(
+            f"⚠  This server appears to be behind Cloudflare, which rejects a single upload larger "
+            f"than {cloudflare.MAX_UPLOAD_MB}MB. A chunk size of {chunk_mb}MB will likely fail with "
+            f"a 413 error - {cloudflare.SAFE_CHUNK_MB}MB or lower is safe."
+        )
+        self._cloudflare_warning.pack(anchor="w", pady=(4, 0))
+
+    def _hide_cloudflare_warning(self) -> None:
+        self._cloudflare_warning.pack_forget()
 
     def _prompt_for_mfa_code(self) -> str | None:
         """Called from a background worker thread (Test Connection / Fetch Folders); shows the
@@ -283,10 +375,20 @@ class SettingsWindow(ctk.CTkToplevel):
         reliability_body = widgets.section_card(tab, "Reliability")
         self._max_retries_entry = widgets.labeled_entry(reliability_body, "Max retry attempts per file:", str(self._config.max_retry_attempts))
         self._retry_backoff_entry = widgets.labeled_entry(reliability_body, "Retry backoff (seconds):", str(self._config.retry_backoff_seconds))
-        widgets.caption(reliability_body, "The delay doubles after each failed attempt, up to 30 minutes.").pack(anchor="w", pady=(2, 0))
+        widgets.caption(
+            reliability_body,
+            f"Attempts {MAX_RETRY_ATTEMPTS_MIN}-{MAX_RETRY_ATTEMPTS_MAX}, backoff "
+            f"{RETRY_BACKOFF_MIN_SECONDS}-{RETRY_BACKOFF_MAX_SECONDS} seconds. The delay doubles "
+            "after each failed attempt, up to 30 minutes.",
+        ).pack(anchor="w", pady=(2, 0))
 
         startup_body = widgets.section_card(tab, "Startup & Notifications")
-        self._start_with_windows_var = ctk.BooleanVar(value=self._config.start_with_windows)
+        # Read from the registry rather than from the saved config. The Run entry can be removed
+        # behind the app's back (a cleanup utility, another startup manager, a manual regedit), and
+        # rendering the config would leave the checkbox ticked while the app no longer starts with
+        # Windows. Whatever is shown here is what Save writes back, so opening Settings and saving
+        # also resolves the drift.
+        self._start_with_windows_var = ctk.BooleanVar(value=_start_with_windows_state(self._config))
         ctk.CTkCheckBox(startup_body, text="Start Fireshare Agent automatically when you sign in to Windows", variable=self._start_with_windows_var, font=widgets.body_font()).pack(anchor="w", pady=4)
         self._notifications_var = ctk.BooleanVar(value=self._config.show_upload_notifications)
         ctk.CTkCheckBox(startup_body, text="Show a tray notification for each upload", variable=self._notifications_var, font=widgets.body_font()).pack(anchor="w", pady=4)
@@ -312,7 +414,22 @@ class SettingsWindow(ctk.CTkToplevel):
 
     # ------------------------------------------------------------------ Save
 
-    def _build_config_from_fields(self, persist_secrets: bool) -> AppConfig:
+    def _read_bounded(
+        self, entry, default: int, minimum: int, maximum: int, label: str, unit: str, adjustments: list[str],
+    ) -> int:
+        """Reads one numeric field, clamps it, and - if the typed value was out of range - rewrites
+        the field with what was actually stored and records a note for the user. Silently accepting
+        0 here is what let a chunk size of 0 become 1-byte chunks."""
+        typed = _safe_int(entry.get(), default)
+        value = clamp(typed, minimum, maximum)
+        if value != typed:
+            adjustments.append(f"{label} must be {minimum}-{maximum} {unit} (you entered {typed}, using {value})")
+            entry.delete(0, "end")
+            entry.insert(0, str(value))
+        return value
+
+    def _build_config_from_fields(self, persist_secrets: bool, adjustments: list[str] | None = None) -> AppConfig:
+        adjustments = adjustments if adjustments is not None else []
         config = copy.deepcopy(self._config)
 
         config.watch_folders = list(self._watch_folders)
@@ -326,7 +443,10 @@ class SettingsWindow(ctk.CTkToplevel):
         config.web_api.ignore_certificate_errors = self._webapi_ignore_cert_var.get()
         config.web_api.mirror_local_folder_structure = self._mirror_folders_var.get()
         config.web_api.target_folder = self._webapi_folder_combo.get().strip()
-        config.web_api.chunk_size_bytes = _safe_int(self._webapi_chunk_entry.get(), 50) * 1024 * 1024
+        config.web_api.chunk_size_bytes = self._read_bounded(
+            self._webapi_chunk_entry, 50, CHUNK_SIZE_MB_MIN, CHUNK_SIZE_MB_MAX,
+            "Chunk size", "MB", adjustments,
+        ) * 1024 * 1024
 
         webapi_credentials_changed = (
             bool(self._webapi_password_entry.get())
@@ -340,8 +460,14 @@ class SettingsWindow(ctk.CTkToplevel):
             # what's now in these fields.
             clear_persisted_web_api_session()
 
-        config.max_retry_attempts = _safe_int(self._max_retries_entry.get(), 5)
-        config.retry_backoff_seconds = _safe_int(self._retry_backoff_entry.get(), 30)
+        config.max_retry_attempts = self._read_bounded(
+            self._max_retries_entry, 5, MAX_RETRY_ATTEMPTS_MIN, MAX_RETRY_ATTEMPTS_MAX,
+            "Max retry attempts", "", adjustments,
+        )
+        config.retry_backoff_seconds = self._read_bounded(
+            self._retry_backoff_entry, 30, RETRY_BACKOFF_MIN_SECONDS, RETRY_BACKOFF_MAX_SECONDS,
+            "Retry backoff", "seconds", adjustments,
+        )
         config.start_with_windows = self._start_with_windows_var.get()
         config.show_upload_notifications = self._notifications_var.get()
         config.auto_check_for_updates = self._auto_update_var.get()
@@ -357,11 +483,21 @@ class SettingsWindow(ctk.CTkToplevel):
             set_secret(field.secret_key, value)
 
     def _save(self) -> None:
+        adjustments: list[str] = []
         try:
-            new_config = self._build_config_from_fields(persist_secrets=True)
+            new_config = self._build_config_from_fields(persist_secrets=True, adjustments=adjustments)
         except Exception as ex:
             self._save_error_label.configure(text=f"Could not save: {ex}")
             return
+
+        if adjustments:
+            # Deliberately does not close. These values change how the agent behaves - a chunk size
+            # of 0 would have meant 1-byte chunks - so the corrected number is written back into the
+            # field and the user gets to see it before committing to it. Clicking Save again with
+            # the values now in range goes straight through.
+            self._save_error_label.configure(text=" - ".join(adjustments) + ". Check and Save again.")
+            return
+        self._save_error_label.configure(text="")
 
         from fireshare_agent import startup
 
@@ -372,6 +508,39 @@ class SettingsWindow(ctk.CTkToplevel):
 
         self._on_save(new_config)
         self.destroy()
+
+
+def _keep_password_only_if_confirmed(previous_password: str | None, confirmed: bool) -> None:
+    """Rolls the stored password back to what it was, unless the server just confirmed the new one.
+
+    Test Connection has to write the password to Credential Manager *before* the test, because the
+    MFA follow-up inside the login flow reads it back from there. The cost used to be that a typo
+    was persisted permanently: the user tests, sees "login failed", closes Settings without saving,
+    and the background pipeline goes on retrying with the wrong password - which is exactly how an
+    account ends up locked out by its own uploader. Narrowing the window to the duration of the
+    test keeps the MFA flow working while removing that trap.
+
+    A cancelled MFA prompt counts as unconfirmed and reverts, even though reaching the MFA step
+    proves the password was right. Reverting to the previous known state is the conservative
+    choice, and Save still persists unconditionally."""
+    if confirmed:
+        return
+    if previous_password is None:
+        delete_secret(WEB_API_PASSWORD)
+    else:
+        set_secret(WEB_API_PASSWORD, previous_password)
+
+
+def _start_with_windows_state(config: AppConfig) -> bool:
+    """What the "Start with Windows" checkbox should show: the registry's answer, falling back to
+    the saved config only if the registry cannot be read at all (a non-Windows host, where the
+    module's `winreg` import fails outright). is_enabled() already absorbs its own OSErrors."""
+    try:
+        from fireshare_agent import startup
+
+        return startup.is_enabled()
+    except Exception:
+        return config.start_with_windows
 
 
 def _split_extensions(raw: str) -> list[str]:

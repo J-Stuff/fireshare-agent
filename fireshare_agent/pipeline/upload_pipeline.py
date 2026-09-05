@@ -5,16 +5,18 @@ upload bandwidth or the OS with parallel large-file transfers.
 """
 from __future__ import annotations
 
+import logging
 import os
 import queue
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
 from fireshare_agent.config.app_config import AppConfig
 from fireshare_agent.manifest import fingerprint
-from fireshare_agent.manifest.store import ManifestStore
+from fireshare_agent.manifest.store import ManifestEntry, ManifestStore
 from fireshare_agent.models import MediaKind, PendingFile, PostUploadAction
 from fireshare_agent.pipeline.activity import PipelineActivity, PipelineEventKind
 from fireshare_agent.uploaders.base import Uploader
@@ -22,10 +24,36 @@ from fireshare_agent.uploaders.web_api_uploader import WebApiUploader
 from fireshare_agent.watching.folder_watcher import FolderWatcherService
 from fireshare_agent.watching.readiness import is_ready
 
+log = logging.getLogger(__name__)
+
 _NOT_READY_RETRY_DELAY_SECONDS = 15.0
 _MAX_WAIT_FOR_READY_SECONDS = 24 * 60 * 60  # a file that never stabilizes after 24h is abandoned
 _MAX_RETRY_BACKOFF_SECONDS = 30 * 60
 _UPLOAD_METHOD_LABEL = "web_api"  # recorded in the manifest DB for historical/debugging purposes
+
+
+_REVIEW_ACTION_VERB = {
+    PostUploadAction.LEAVE: "keep",
+    PostUploadAction.MOVE_TO_SUBFOLDER: "move",
+    PostUploadAction.DELETE: "delete",
+}
+
+
+@dataclass(frozen=True)
+class ReviewOutcome:
+    """What actually happened when the user's decision about a reviewed file was carried out.
+    `resolved` means the row should stop appearing in the review list; a failure that the user
+    could retry (a locked file, say) should leave it unresolved so the entry stays put."""
+    resolved: bool
+    message: str
+
+    @staticmethod
+    def done(message: str) -> "ReviewOutcome":
+        return ReviewOutcome(True, message)
+
+    @staticmethod
+    def failed(message: str) -> "ReviewOutcome":
+        return ReviewOutcome(False, message)
 
 
 class UploadPipeline:
@@ -40,6 +68,10 @@ class UploadPipeline:
         self._mfa_code_provider = mfa_code_provider
 
         self._watcher = FolderWatcherService()
+        # Pause is sticky across restarts: an agent the user paused stays paused until they
+        # resume it, rather than quietly coming back up watching after the next reboot.
+        if manifest.is_watching_paused():
+            self._watcher.pause()
         self._queue: "queue.Queue[str | None]" = queue.Queue()
         self._in_flight: dict[str, float] = {}  # path -> first-seen monotonic timestamp
         self._in_flight_lock = threading.Lock()
@@ -71,6 +103,46 @@ class UploadPipeline:
     def failed_count(self) -> int:
         return self._manifest.get_failed_count()
 
+    @property
+    def pending_review_count(self) -> int:
+        return self._manifest.get_pending_review_count()
+
+    def get_pending_review(self) -> list[ManifestEntry]:
+        return self._manifest.get_pending_review()
+
+    def resolve_pending_review(self, entry: ManifestEntry, action: PostUploadAction) -> ReviewOutcome:
+        """Applies the user's decision about the local copy of a file that was matched to a
+        server-side file by name alone. Called from the UI thread, not the upload worker - it
+        touches only this one file and the manifest row for it, both of which the worker has
+        already finished with by the time a row becomes reviewable."""
+        name = os.path.basename(entry.path)
+
+        # The row can outlive the file: minutes or days may pass between the match being recorded
+        # and the user getting to it, and in the meantime they may have moved or deleted the file
+        # in Explorer themselves. There is nothing left to act on, and leaving the entry queued
+        # would strand it there permanently, so treat it as answered rather than as a failure.
+        if not os.path.exists(entry.path):
+            self._manifest.clear_pending_review(entry.fingerprint)
+            return ReviewOutcome.done(f"{name} is no longer on disk - removed from the review list.")
+
+        try:
+            self.perform_local_action(entry.path, action)
+        except OSError as ex:
+            # Deliberately leaves the row pending. A locked file is precisely the case the user
+            # can fix (close whatever holds it) and try again, and clearing the flag here would
+            # leave them believing the file had been dealt with when it hadn't.
+            return ReviewOutcome.failed(f"Could not {_REVIEW_ACTION_VERB[action]} {name}: {ex}")
+
+        self._manifest.clear_pending_review(entry.fingerprint)
+        return ReviewOutcome.done(self._review_success_message(name, action))
+
+    def _review_success_message(self, name: str, action: PostUploadAction) -> str:
+        if action == PostUploadAction.MOVE_TO_SUBFOLDER:
+            return f"{name} moved to {self._config.move_to_subfolder_name}."
+        if action == PostUploadAction.DELETE:
+            return f"{name} deleted."
+        return f"{name} kept in place."
+
     def start(self) -> None:
         self._stop_event.clear()
         self._watcher.start(
@@ -96,9 +168,21 @@ class UploadPipeline:
 
     def pause(self) -> None:
         self._watcher.pause()
+        self._persist_paused(True)
 
     def resume(self) -> None:
         self._watcher.resume()
+        self._persist_paused(False)
+
+    def _persist_paused(self, paused: bool) -> None:
+        """Runtime state is updated first and persisted second, so a database problem leaves the
+        agent actually doing what the tray says it is doing - the only thing lost is the memory
+        of it across the next restart. Called on the tray's callback thread, so it must not
+        raise: an unhandled error here would take out the pause toggle itself."""
+        try:
+            self._manifest.set_watching_paused(paused)
+        except Exception:
+            log.exception("Could not persist the pause state; it will not survive a restart.")
 
     def update_config(self, config: AppConfig) -> None:
         """Applies newly saved settings: restarts folder watches and forces the uploader to be rebuilt."""
@@ -111,8 +195,15 @@ class UploadPipeline:
         )
 
     def sync_now(self) -> None:
-        """Walks all watch folders now and enqueues anything not already recorded as uploaded."""
+        """Walks all watch folders now and enqueues anything not already recorded as uploaded.
+
+        Runs on a caller-supplied background thread (see FireshareAgentApp._start_sync), so it can
+        still be part-way through a large library when the user hits Exit. It bails out on the stop
+        event rather than churning the disk enqueueing work that the now-stopped worker will never
+        pick up."""
         for folder in self._config.watch_folders:
+            if self._stop_event.is_set():
+                return
             if not folder.path or not os.path.isdir(folder.path):
                 continue
 
@@ -125,6 +216,8 @@ class UploadPipeline:
                     walker = []
 
             for root, dirs, files in walker:
+                if self._stop_event.is_set():
+                    return
                 if folder.recursive:
                     # Prune the post-upload destination subfolder (at any depth, e.g. also under
                     # a mirrored per-game subfolder) so already-uploaded files that were moved
@@ -180,6 +273,21 @@ class UploadPipeline:
             retrying = self._retry_state.get(path)
 
         if retrying is None:
+            # The manifest check runs *before* the readiness probe, not after it. is_ready()
+            # sleeps 3s unconditionally as its stable-size window, and with the default
+            # post_upload_action = LEAVE every previously-uploaded file stays in the watch folder
+            # and is re-walked by sync_now() on every launch - a few hundred clips is that many
+            # multiples of 3s spent sleeping before the first new file is even looked at.
+            #
+            # Safe to do first because the size is part of the fingerprint string: a file still
+            # being written is a different size from the finished file it will become, so it
+            # cannot match a stored fingerprint and simply falls through to the readiness path
+            # below, exactly as before.
+            precomputed = self._try_compute_fingerprint(path)
+            if precomputed is not None and self._manifest.is_already_handled(precomputed[1]):
+                self._raise_activity(path, kind, PipelineEventKind.SKIPPED_DUPLICATE)
+                return True
+
             if not is_ready(path):
                 with self._in_flight_lock:
                     first_seen = self._in_flight.get(path, time.monotonic())
@@ -196,7 +304,13 @@ class UploadPipeline:
                 return False
 
             size_bytes = os.path.getsize(path)
-            fp = fingerprint.compute(path, size_bytes)
+            if precomputed is not None and precomputed[0] == size_bytes:
+                # Same size as the pre-check moments ago, and is_ready() has just confirmed the
+                # size held steady across its own window too - re-reading a megabyte from each
+                # end of the file would only reproduce the hash we already have.
+                fp = precomputed[1]
+            else:
+                fp = fingerprint.compute(path, size_bytes)
 
             if self._manifest.is_already_handled(fp):
                 self._raise_activity(path, kind, PipelineEventKind.SKIPPED_DUPLICATE)
@@ -211,10 +325,21 @@ class UploadPipeline:
             # Best-effort check against the actual destination (not just our local history) -
             # covers a lost/fresh-install manifest, or a file that was already uploaded some
             # other way.
+            #
+            # Deliberately does NOT run the post-upload action: this match is inferred from the
+            # filename alone (Fireshare exposes no size or content hash to verify against), so
+            # acting on it would mean moving - or, with the delete action configured, permanently
+            # destroying - a local file that may never have been uploaded at all. Instead the row
+            # is flagged for review and the user decides per file; see
+            # WebApiUploader.exists_at_destination and resolve_pending_review below.
             if uploader.exists_at_destination(pending_file):
-                self._manifest.record_already_existed(fp, path, size_bytes, _UPLOAD_METHOD_LABEL)
-                self._apply_post_upload_action(path)
-                self._raise_activity(path, kind, PipelineEventKind.ALREADY_AT_DESTINATION)
+                self._manifest.record_already_existed(
+                    fp, path, size_bytes, _UPLOAD_METHOD_LABEL, pending_review=True
+                )
+                self._raise_activity(
+                    path, kind, PipelineEventKind.ALREADY_AT_DESTINATION,
+                    "Matched an existing file on the server by name - waiting for your review",
+                )
                 return True
 
             self._raise_activity(path, kind, PipelineEventKind.UPLOADING)
@@ -250,6 +375,21 @@ class UploadPipeline:
         self._schedule_requeue(path, backoff)
         return False
 
+    def _try_compute_fingerprint(self, path: str) -> tuple[int, str] | None:
+        """(size, fingerprint) for a file that can be read right now, or None if it can't be.
+
+        None means "unknown", and callers fall through to the normal readiness path - it is not a
+        failure. The file may have been moved between the walk and here, or still be held
+        exclusively by the recorder that is writing it; letting either OSError escape to the
+        worker's generic catch would mark a perfectly good recording as FAILED."""
+        try:
+            size_bytes = os.path.getsize(path)
+            if size_bytes == 0:
+                return None  # a placeholder the recorder has only just created; nothing to hash
+            return size_bytes, fingerprint.compute(path, size_bytes)
+        except OSError:
+            return None
+
     def _clear_retry_state(self, path: str) -> None:
         with self._retry_state_lock:
             self._retry_state.pop(path, None)
@@ -257,11 +397,25 @@ class UploadPipeline:
     def _schedule_requeue(self, path: str, delay_seconds: float) -> None:
         if self._stop_event.is_set():
             return
-        timer = threading.Timer(delay_seconds, self._requeue, args=(path,))
+        # threading.Timer treats a negative delay as "fire immediately", which turns a retry
+        # schedule into a hot loop. Config is clamped now, but this is the place where a bad
+        # number would actually do damage, so it refuses one here too.
+        timer = threading.Timer(max(0.0, delay_seconds), self._requeue, args=(path,))
         timer.daemon = True
         with self._pending_retry_timers_lock:
+            # The list exists only so stop() can cancel what is still pending, but nothing used to
+            # take entries back out of it: a multi-hour "Record" session rechecked every 15s left
+            # ~240 dead Timer objects (each wrapping a Thread) behind per hour. Dropping the
+            # finished ones here keeps it at roughly the number of genuinely pending retries, which
+            # is small enough that the O(n) scan never matters.
+            self._pending_retry_timers = [t for t in self._pending_retry_timers if t.is_alive()]
             self._pending_retry_timers.append(timer)
-        timer.start()
+            # Started while the lock is held, deliberately. An unstarted Timer reports
+            # is_alive() == False, so a timer appended before it was started could be pruned by a
+            # concurrent scheduler between the two steps - quietly losing the only reference
+            # stop() has to cancel it by. Starting here means no other holder of this lock can
+            # ever observe an entry in that not-yet-alive state.
+            timer.start()
 
     def _requeue(self, path: str) -> None:
         if not self._stop_event.is_set():
@@ -275,23 +429,27 @@ class UploadPipeline:
 
     def _apply_post_upload_action(self, path: str) -> None:
         try:
-            action = self._config.post_upload_action
-            if action == PostUploadAction.LEAVE.value:
-                return
-            if action == PostUploadAction.MOVE_TO_SUBFOLDER.value:
-                directory = os.path.dirname(path)
-                subfolder = os.path.join(directory, self._config.move_to_subfolder_name)
-                os.makedirs(subfolder, exist_ok=True)
-                destination = _non_conflicting_path(os.path.join(subfolder, os.path.basename(path)))
-                os.replace(path, destination)
-                return
-            if action == PostUploadAction.DELETE.value:
-                os.remove(path)
-                return
-        except OSError:
+            self.perform_local_action(path, PostUploadAction(self._config.post_upload_action))
+        except (OSError, ValueError):
             # The upload already succeeded and is recorded; a local housekeeping failure
             # (e.g. destination locked) shouldn't be treated as an upload failure.
             pass
+
+    def perform_local_action(self, path: str, action: PostUploadAction) -> None:
+        """Carries out one local file action, raising OSError if it fails. Shared by the
+        automatic post-upload path (which swallows failures) and the review flow (which reports
+        them back to the user), so both apply identical move/delete semantics."""
+        if action == PostUploadAction.LEAVE:
+            return
+        if action == PostUploadAction.MOVE_TO_SUBFOLDER:
+            directory = os.path.dirname(path)
+            subfolder = os.path.join(directory, self._config.move_to_subfolder_name)
+            os.makedirs(subfolder, exist_ok=True)
+            destination = _non_conflicting_path(os.path.join(subfolder, os.path.basename(path)))
+            os.replace(path, destination)
+            return
+        if action == PostUploadAction.DELETE:
+            os.remove(path)
 
     def _resolve_kind(self, path: str) -> MediaKind | None:
         ext = Path(path).suffix.lower()

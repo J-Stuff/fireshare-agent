@@ -56,22 +56,32 @@ class TrayIcon:
         has_update: Callable[[], bool] = lambda: False,
         update_version: Callable[[], str] = lambda: "",
         on_update_now: Callable[[], None] = lambda: None,
+        pending_review_count: Callable[[], int] = lambda: 0,
     ) -> None:
         self._is_paused = is_paused
         self._has_failures = has_failures
         self._has_update = has_update
         self._update_version = update_version
+        self._pending_review_count = pending_review_count
         self._on_exit = on_exit
 
+        # Built from the live callbacks rather than hardcoded to the unpaused artwork: the pause
+        # state is restored from the manifest before the tray is constructed, so an agent that
+        # was paused when it last exited must come back up already showing as paused.
         self.icon = pystray.Icon(
             "FireshareAgent",
-            icon=_build_icon_image(False, False),
-            title="Fireshare Agent",
+            icon=_build_icon_image(self._is_paused(), self._has_failures()),
+            title=self._title(),
             menu=pystray.Menu(
                 pystray.MenuItem(
                     lambda item: f"Update to {self._update_version()} Now",
                     lambda: on_update_now(),
                     visible=lambda item: self._has_update(),
+                ),
+                pystray.MenuItem(
+                    lambda item: f"Review {self._pending_review_count()} File(s)...",
+                    lambda: on_open_activity(),
+                    visible=lambda item: self._pending_review_count() > 0,
                 ),
                 pystray.MenuItem("Open Settings", lambda: on_open_settings()),
                 pystray.MenuItem("View Activity / Log", lambda: on_open_activity()),
@@ -85,9 +95,12 @@ class TrayIcon:
             ),
         )
 
+    def _title(self) -> str:
+        return "Fireshare Agent (paused)" if self._is_paused() else "Fireshare Agent"
+
     def refresh(self) -> None:
         self.icon.icon = _build_icon_image(self._is_paused(), self._has_failures())
-        self.icon.title = "Fireshare Agent (paused)" if self._is_paused() else "Fireshare Agent"
+        self.icon.title = self._title()
         self.icon.update_menu()
 
     def run(self) -> None:

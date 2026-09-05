@@ -6,6 +6,45 @@ from typing import Any
 
 from fireshare_agent.models import PostUploadAction
 
+# Bounds for the numeric settings, kept here rather than in the settings window so the UI and the
+# config loader clamp against the same numbers. Both matter: config.json is a documented,
+# hand-editable file (the README points users at it), so the UI is not the only way a value gets in.
+#
+# Chunk size: below ~1MB the per-request overhead dominates and a large clip becomes an absurd
+# number of POSTs; above ~256MB the peak memory matters, since _upload_video_chunked reads a whole
+# chunk into memory before sending it. The Cloudflare-related advice (stay under 100MB) is guidance
+# in the UI rather than a hard cap - a LAN instance with no proxy in front of it is free to use more.
+CHUNK_SIZE_MB_MIN = 1
+CHUNK_SIZE_MB_MAX = 256
+
+# Backoff: the pipeline doubles this after each failed attempt and caps the effective delay at 30
+# minutes, so anything past an hour here is already meaningless. The floor exists to stop a retry
+# storm against a server that is briefly down.
+RETRY_BACKOFF_MIN_SECONDS = 5
+RETRY_BACKOFF_MAX_SECONDS = 3600
+
+# Retries: 0 would mean "never retry", which reads as a way to disable retrying but actually just
+# fails every transient blip permanently. The upper bound catches a typo'd extra digit.
+MAX_RETRY_ATTEMPTS_MIN = 1
+MAX_RETRY_ATTEMPTS_MAX = 50
+
+
+def clamp(value: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(maximum, value))
+
+
+def _bounded(raw: Any, default: int, minimum: int, maximum: int) -> int:
+    """Coerces one value from a persisted config into the allowed range. A missing key, or a value
+    that isn't a number at all (config.json is hand-editable, so `"50"` or `null` are both
+    realistic), falls back to the default rather than propagating a bad type into the pipeline."""
+    if raw is None:
+        raw = default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return clamp(value, minimum, maximum)
+
 
 @dataclass
 class WatchFolderConfig:
@@ -62,8 +101,18 @@ class AppConfig:
         config.move_to_subfolder_name = data.get("move_to_subfolder_name", config.move_to_subfolder_name)
         if "web_api" in data:
             config.web_api = WebApiSettings(**data["web_api"])
-        config.max_retry_attempts = data.get("max_retry_attempts", config.max_retry_attempts)
-        config.retry_backoff_seconds = data.get("retry_backoff_seconds", config.retry_backoff_seconds)
+        config.max_retry_attempts = _bounded(
+            data.get("max_retry_attempts"), config.max_retry_attempts,
+            MAX_RETRY_ATTEMPTS_MIN, MAX_RETRY_ATTEMPTS_MAX,
+        )
+        config.retry_backoff_seconds = _bounded(
+            data.get("retry_backoff_seconds"), config.retry_backoff_seconds,
+            RETRY_BACKOFF_MIN_SECONDS, RETRY_BACKOFF_MAX_SECONDS,
+        )
+        config.web_api.chunk_size_bytes = _bounded(
+            config.web_api.chunk_size_bytes, WebApiSettings.chunk_size_bytes,
+            CHUNK_SIZE_MB_MIN * 1024 * 1024, CHUNK_SIZE_MB_MAX * 1024 * 1024,
+        )
         config.start_with_windows = data.get("start_with_windows", config.start_with_windows)
         config.show_upload_notifications = data.get("show_upload_notifications", config.show_upload_notifications)
         config.auto_check_for_updates = data.get("auto_check_for_updates", config.auto_check_for_updates)
