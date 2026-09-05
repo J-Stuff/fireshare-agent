@@ -36,3 +36,6 @@ desktop.ini
 *.db
 *.log
 /config.json
+
+# Local working notes (backlog, scratch planning) - not part of the published repo
+/notes/
