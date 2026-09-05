@@ -11,7 +11,12 @@ alternative here), so the fixture snapshots and restores whatever was there befo
 import customtkinter as ctk
 import pytest
 
-from fireshare_agent.config.app_config import AppConfig
+from fireshare_agent.config.app_config import (
+    CHUNK_SIZE_MB_MIN,
+    MAX_RETRY_ATTEMPTS_MIN,
+    RETRY_BACKOFF_MIN_SECONDS,
+    AppConfig,
+)
 from fireshare_agent.config.secrets import WEB_API_PASSWORD, delete_secret, get_secret, set_secret
 from fireshare_agent.ui.settings_window import SettingsWindow
 
@@ -66,3 +71,70 @@ def test_building_config_for_display_only_does_not_touch_credential_manager(tk_r
         assert get_secret(WEB_API_PASSWORD) is None
     finally:
         window.destroy()
+
+
+def _set(entry, value: str) -> None:
+    entry.delete(0, "end")
+    entry.insert(0, value)
+
+
+def test_out_of_range_numbers_are_clamped_and_written_back_into_the_field(tk_root):
+    window = SettingsWindow(tk_root, AppConfig(), on_save=lambda _c: None)
+    tk_root.update()
+    try:
+        _set(window._webapi_chunk_entry, "0")
+        _set(window._retry_backoff_entry, "-30")
+        _set(window._max_retries_entry, "0")
+
+        adjustments: list[str] = []
+        config = window._build_config_from_fields(persist_secrets=False, adjustments=adjustments)
+
+        assert config.web_api.chunk_size_bytes == CHUNK_SIZE_MB_MIN * 1024 * 1024
+        assert config.retry_backoff_seconds == RETRY_BACKOFF_MIN_SECONDS
+        assert config.max_retry_attempts == MAX_RETRY_ATTEMPTS_MIN
+        assert len(adjustments) == 3
+        # The user must be able to see what was actually stored, not just be told it changed.
+        assert window._webapi_chunk_entry.get() == str(CHUNK_SIZE_MB_MIN)
+        assert window._retry_backoff_entry.get() == str(RETRY_BACKOFF_MIN_SECONDS)
+    finally:
+        window.destroy()
+
+
+def test_saving_an_out_of_range_value_reports_it_instead_of_closing(tk_root):
+    saved: list[AppConfig] = []
+    window = SettingsWindow(tk_root, AppConfig(), on_save=saved.append)
+    tk_root.update()
+    try:
+        _set(window._webapi_chunk_entry, "0")
+
+        window._save()
+
+        assert saved == []  # must not have committed the config
+        assert window.winfo_exists()  # nor closed over the correction
+        assert "Chunk size" in window._save_error_label.cget("text")
+
+        # Saving again, with the field now holding the corrected value, goes straight through.
+        window._save()
+        assert len(saved) == 1
+        assert saved[0].web_api.chunk_size_bytes == CHUNK_SIZE_MB_MIN * 1024 * 1024
+    finally:
+        if window.winfo_exists():
+            window.destroy()
+
+
+def test_in_range_values_save_without_complaint(tk_root):
+    saved: list[AppConfig] = []
+    window = SettingsWindow(tk_root, AppConfig(), on_save=saved.append)
+    tk_root.update()
+    try:
+        _set(window._webapi_chunk_entry, "50")
+        _set(window._retry_backoff_entry, "30")
+        _set(window._max_retries_entry, "5")
+
+        window._save()
+
+        assert len(saved) == 1
+        assert saved[0].web_api.chunk_size_bytes == 50 * 1024 * 1024
+    finally:
+        if window.winfo_exists():
+            window.destroy()

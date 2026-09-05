@@ -17,7 +17,17 @@ from typing import Callable
 import customtkinter as ctk
 
 from fireshare_agent import __version__, assets
-from fireshare_agent.config.app_config import AppConfig, WatchFolderConfig
+from fireshare_agent.config.app_config import (
+    CHUNK_SIZE_MB_MAX,
+    CHUNK_SIZE_MB_MIN,
+    MAX_RETRY_ATTEMPTS_MAX,
+    MAX_RETRY_ATTEMPTS_MIN,
+    RETRY_BACKOFF_MAX_SECONDS,
+    RETRY_BACKOFF_MIN_SECONDS,
+    AppConfig,
+    WatchFolderConfig,
+    clamp,
+)
 from fireshare_agent.config.secrets import WEB_API_PASSWORD, set_secret
 from fireshare_agent.models import PostUploadAction
 from fireshare_agent.ui import mfa_dialog, widgets
@@ -215,7 +225,11 @@ class SettingsWindow(ctk.CTkToplevel):
 
         chunk_mb = max(1, s.chunk_size_bytes // (1024 * 1024))
         self._webapi_chunk_entry = widgets.labeled_entry(upload_body, "Chunk size (MB):", str(chunk_mb))
-        widgets.caption(upload_body, "Keep this well under 100MB if your Fireshare instance is behind Cloudflare.").pack(anchor="w", pady=(2, 0))
+        widgets.caption(
+            upload_body,
+            f"{CHUNK_SIZE_MB_MIN}-{CHUNK_SIZE_MB_MAX} MB. Keep this well under 100MB if your "
+            "Fireshare instance is behind Cloudflare.",
+        ).pack(anchor="w", pady=(2, 0))
 
         test_row = ctk.CTkFrame(tab, fg_color="transparent")
         test_row.pack(fill="x", pady=(0, 4))
@@ -283,7 +297,12 @@ class SettingsWindow(ctk.CTkToplevel):
         reliability_body = widgets.section_card(tab, "Reliability")
         self._max_retries_entry = widgets.labeled_entry(reliability_body, "Max retry attempts per file:", str(self._config.max_retry_attempts))
         self._retry_backoff_entry = widgets.labeled_entry(reliability_body, "Retry backoff (seconds):", str(self._config.retry_backoff_seconds))
-        widgets.caption(reliability_body, "The delay doubles after each failed attempt, up to 30 minutes.").pack(anchor="w", pady=(2, 0))
+        widgets.caption(
+            reliability_body,
+            f"Attempts {MAX_RETRY_ATTEMPTS_MIN}-{MAX_RETRY_ATTEMPTS_MAX}, backoff "
+            f"{RETRY_BACKOFF_MIN_SECONDS}-{RETRY_BACKOFF_MAX_SECONDS} seconds. The delay doubles "
+            "after each failed attempt, up to 30 minutes.",
+        ).pack(anchor="w", pady=(2, 0))
 
         startup_body = widgets.section_card(tab, "Startup & Notifications")
         self._start_with_windows_var = ctk.BooleanVar(value=self._config.start_with_windows)
@@ -312,7 +331,22 @@ class SettingsWindow(ctk.CTkToplevel):
 
     # ------------------------------------------------------------------ Save
 
-    def _build_config_from_fields(self, persist_secrets: bool) -> AppConfig:
+    def _read_bounded(
+        self, entry, default: int, minimum: int, maximum: int, label: str, unit: str, adjustments: list[str],
+    ) -> int:
+        """Reads one numeric field, clamps it, and - if the typed value was out of range - rewrites
+        the field with what was actually stored and records a note for the user. Silently accepting
+        0 here is what let a chunk size of 0 become 1-byte chunks."""
+        typed = _safe_int(entry.get(), default)
+        value = clamp(typed, minimum, maximum)
+        if value != typed:
+            adjustments.append(f"{label} must be {minimum}-{maximum} {unit} (you entered {typed}, using {value})")
+            entry.delete(0, "end")
+            entry.insert(0, str(value))
+        return value
+
+    def _build_config_from_fields(self, persist_secrets: bool, adjustments: list[str] | None = None) -> AppConfig:
+        adjustments = adjustments if adjustments is not None else []
         config = copy.deepcopy(self._config)
 
         config.watch_folders = list(self._watch_folders)
@@ -326,7 +360,10 @@ class SettingsWindow(ctk.CTkToplevel):
         config.web_api.ignore_certificate_errors = self._webapi_ignore_cert_var.get()
         config.web_api.mirror_local_folder_structure = self._mirror_folders_var.get()
         config.web_api.target_folder = self._webapi_folder_combo.get().strip()
-        config.web_api.chunk_size_bytes = _safe_int(self._webapi_chunk_entry.get(), 50) * 1024 * 1024
+        config.web_api.chunk_size_bytes = self._read_bounded(
+            self._webapi_chunk_entry, 50, CHUNK_SIZE_MB_MIN, CHUNK_SIZE_MB_MAX,
+            "Chunk size", "MB", adjustments,
+        ) * 1024 * 1024
 
         webapi_credentials_changed = (
             bool(self._webapi_password_entry.get())
@@ -340,8 +377,14 @@ class SettingsWindow(ctk.CTkToplevel):
             # what's now in these fields.
             clear_persisted_web_api_session()
 
-        config.max_retry_attempts = _safe_int(self._max_retries_entry.get(), 5)
-        config.retry_backoff_seconds = _safe_int(self._retry_backoff_entry.get(), 30)
+        config.max_retry_attempts = self._read_bounded(
+            self._max_retries_entry, 5, MAX_RETRY_ATTEMPTS_MIN, MAX_RETRY_ATTEMPTS_MAX,
+            "Max retry attempts", "", adjustments,
+        )
+        config.retry_backoff_seconds = self._read_bounded(
+            self._retry_backoff_entry, 30, RETRY_BACKOFF_MIN_SECONDS, RETRY_BACKOFF_MAX_SECONDS,
+            "Retry backoff", "seconds", adjustments,
+        )
         config.start_with_windows = self._start_with_windows_var.get()
         config.show_upload_notifications = self._notifications_var.get()
         config.auto_check_for_updates = self._auto_update_var.get()
@@ -357,11 +400,21 @@ class SettingsWindow(ctk.CTkToplevel):
             set_secret(field.secret_key, value)
 
     def _save(self) -> None:
+        adjustments: list[str] = []
         try:
-            new_config = self._build_config_from_fields(persist_secrets=True)
+            new_config = self._build_config_from_fields(persist_secrets=True, adjustments=adjustments)
         except Exception as ex:
             self._save_error_label.configure(text=f"Could not save: {ex}")
             return
+
+        if adjustments:
+            # Deliberately does not close. These values change how the agent behaves - a chunk size
+            # of 0 would have meant 1-byte chunks - so the corrected number is written back into the
+            # field and the user gets to see it before committing to it. Clicking Save again with
+            # the values now in range goes straight through.
+            self._save_error_label.configure(text=" - ".join(adjustments) + ". Check and Save again.")
+            return
+        self._save_error_label.configure(text="")
 
         from fireshare_agent import startup
 

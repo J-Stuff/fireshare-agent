@@ -333,7 +333,10 @@ class UploadPipeline:
     def _schedule_requeue(self, path: str, delay_seconds: float) -> None:
         if self._stop_event.is_set():
             return
-        timer = threading.Timer(delay_seconds, self._requeue, args=(path,))
+        # threading.Timer treats a negative delay as "fire immediately", which turns a retry
+        # schedule into a hot loop. Config is clamped now, but this is the place where a bad
+        # number would actually do damage, so it refuses one here too.
+        timer = threading.Timer(max(0.0, delay_seconds), self._requeue, args=(path,))
         timer.daemon = True
         with self._pending_retry_timers_lock:
             self._pending_retry_timers.append(timer)
