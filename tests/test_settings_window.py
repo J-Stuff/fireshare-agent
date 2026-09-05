@@ -19,6 +19,7 @@ from fireshare_agent.config.app_config import (
 )
 from fireshare_agent.config.secrets import WEB_API_PASSWORD, delete_secret, get_secret, set_secret
 from fireshare_agent.ui.settings_window import SettingsWindow
+from fireshare_agent.uploaders import cloudflare
 
 
 @pytest.fixture
@@ -120,6 +121,76 @@ def test_saving_an_out_of_range_value_reports_it_instead_of_closing(tk_root):
     finally:
         if window.winfo_exists():
             window.destroy()
+
+
+def test_oversized_chunk_warns_when_the_server_is_behind_cloudflare(tk_root):
+    window = SettingsWindow(tk_root, AppConfig(), on_save=lambda _c: None)
+    tk_root.update()
+    try:
+        _set(window._webapi_url_entry, "https://fireshare.example.com")
+        _set(window._webapi_chunk_entry, str(cloudflare.SAFE_CHUNK_MB + 20))
+        # Pre-seed the cache so the check resolves without a network probe.
+        window._cloudflare_by_url["https://fireshare.example.com"] = True
+
+        window._check_cloudflare_chunk_limit()
+        tk_root.update()
+
+        assert window._cloudflare_warning.winfo_ismapped()
+    finally:
+        window.destroy()
+
+
+def test_oversized_chunk_is_not_flagged_when_cloudflare_is_absent(tk_root):
+    window = SettingsWindow(tk_root, AppConfig(), on_save=lambda _c: None)
+    tk_root.update()
+    try:
+        _set(window._webapi_url_entry, "https://fireshare.example.com")
+        _set(window._webapi_chunk_entry, str(cloudflare.SAFE_CHUNK_MB + 20))
+        window._cloudflare_by_url["https://fireshare.example.com"] = False
+
+        window._check_cloudflare_chunk_limit()
+        tk_root.update()
+
+        assert not window._cloudflare_warning.winfo_ismapped()
+    finally:
+        window.destroy()
+
+
+def test_a_safe_chunk_size_never_probes_the_network(tk_root, monkeypatch):
+    # The check runs on every focus change out of the URL and chunk fields, so the common case
+    # (a sane chunk size) must not cost a request each time.
+    def _fail(*a, **k):  # pragma: no cover - must not be reached
+        raise AssertionError("no Cloudflare probe should run for an in-range chunk size")
+
+    monkeypatch.setattr(cloudflare, "is_behind_cloudflare", _fail)
+
+    window = SettingsWindow(tk_root, AppConfig(), on_save=lambda _c: None)
+    tk_root.update()
+    try:
+        _set(window._webapi_url_entry, "https://fireshare.example.com")
+        _set(window._webapi_chunk_entry, "50")
+
+        window._check_cloudflare_chunk_limit()
+        tk_root.update()
+
+        assert not window._cloudflare_warning.winfo_ismapped()
+    finally:
+        window.destroy()
+
+
+def test_an_undetermined_probe_is_not_cached_as_not_cloudflare(tk_root):
+    window = SettingsWindow(tk_root, AppConfig(), on_save=lambda _c: None)
+    tk_root.update()
+    try:
+        _set(window._webapi_url_entry, "https://fireshare.example.com")
+        _set(window._webapi_chunk_entry, str(cloudflare.SAFE_CHUNK_MB + 20))
+
+        window._on_cloudflare_probe_result("https://fireshare.example.com", None)
+
+        # An unreachable server must stay unknown, so a later probe can still find Cloudflare.
+        assert "https://fireshare.example.com" not in window._cloudflare_by_url
+    finally:
+        window.destroy()
 
 
 def test_in_range_values_save_without_complaint(tk_root):

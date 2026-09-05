@@ -31,6 +31,7 @@ from fireshare_agent.config.app_config import (
 from fireshare_agent.config.secrets import WEB_API_PASSWORD, set_secret
 from fireshare_agent.models import PostUploadAction
 from fireshare_agent.ui import mfa_dialog, widgets
+from fireshare_agent.uploaders import cloudflare
 from fireshare_agent.uploaders.web_api_uploader import WebApiUploader, clear_persisted_web_api_session
 
 POST_UPLOAD_LABELS = {
@@ -55,6 +56,9 @@ class SettingsWindow(ctk.CTkToplevel):
         # Work on a deep copy so Cancel (closing without saving) never mutates live config.
         self._config = copy.deepcopy(config)
         self._watch_folders: list[WatchFolderConfig] = list(self._config.watch_folders)
+        # base_url -> is-behind-Cloudflare, for definite answers only. Avoids re-probing the
+        # same server on every focus change.
+        self._cloudflare_by_url: dict[str, bool] = {}
 
         self.title("Fireshare Agent - Settings")
         self.geometry("940x680")
@@ -225,6 +229,17 @@ class SettingsWindow(ctk.CTkToplevel):
 
         chunk_mb = max(1, s.chunk_size_bytes // (1024 * 1024))
         self._webapi_chunk_entry = widgets.labeled_entry(upload_body, "Chunk size (MB):", str(chunk_mb))
+        # Re-checked when the user leaves the field rather than on every keystroke: the probe is a
+        # network round trip, and a half-typed "1" on the way to "150" is not worth warning about.
+        self._webapi_chunk_entry.bind("<FocusOut>", lambda _e: self._check_cloudflare_chunk_limit())
+        self._webapi_url_entry.bind("<FocusOut>", lambda _e: self._check_cloudflare_chunk_limit())
+
+        self._cloudflare_warning = widgets.LinkLabel(
+            upload_body,
+            text="",
+            url=cloudflare.UPLOAD_LIMITS_DOC_URL,
+            link_text="Read Cloudflare's upload limits",
+        )
         widgets.caption(
             upload_body,
             f"{CHUNK_SIZE_MB_MIN}-{CHUNK_SIZE_MB_MAX} MB. Keep this well under 100MB if your "
@@ -236,6 +251,8 @@ class SettingsWindow(ctk.CTkToplevel):
         ctk.CTkButton(test_row, text="Test Connection", width=140, command=self._test_web_api_connection).pack(side="left")
         self._connection_status_label = ctk.CTkLabel(test_row, text="", anchor="w", font=widgets.caption_font())
         self._connection_status_label.pack(side="left", padx=10, fill="x", expand=True)
+
+        self._check_cloudflare_chunk_limit()
 
     def _test_web_api_connection(self) -> None:
         widgets.set_status(self._connection_status_label, "info", "Testing...")
@@ -251,6 +268,7 @@ class SettingsWindow(ctk.CTkToplevel):
                 self.after(0, lambda: widgets.set_status(self._connection_status_label, "error", str(ex)))
                 return
             self.after(0, lambda: widgets.set_status(self._connection_status_label, "success" if result.success else "error", result.message))
+            self.after(0, self._check_cloudflare_chunk_limit)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -274,6 +292,59 @@ class SettingsWindow(ctk.CTkToplevel):
                 self.after(0, lambda: widgets.set_status(self._connection_status_label, "info", "Logged in, but the server returned no folders."))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    # ------------------------------------------------------- Cloudflare chunk check
+
+    def _check_cloudflare_chunk_limit(self) -> None:
+        """Warns when the configured chunk size would exceed what Cloudflare will proxy, but only
+        once we actually know Cloudflare is in front of this server. Cheap paths first: if the
+        chunk size is already safe, or the answer for this URL is cached, no network call happens
+        at all - this runs on every focus change out of the URL and chunk fields."""
+        chunk_mb = _safe_int(self._webapi_chunk_entry.get(), 50)
+        base_url = self._webapi_url_entry.get().strip()
+
+        if chunk_mb <= cloudflare.SAFE_CHUNK_MB or not base_url:
+            self._hide_cloudflare_warning()
+            return
+
+        cached = self._cloudflare_by_url.get(base_url)
+        if cached is not None:
+            self._render_cloudflare_warning(cached, chunk_mb)
+            return
+
+        verify = not self._webapi_ignore_cert_var.get()
+
+        def worker() -> None:
+            detected = cloudflare.is_behind_cloudflare(base_url, verify=verify)
+            self.after(0, lambda: self._on_cloudflare_probe_result(base_url, detected))
+
+        threading.Thread(target=worker, daemon=True, name="fireshare-agent-cloudflare-probe").start()
+
+    def _on_cloudflare_probe_result(self, base_url: str, detected: bool | None) -> None:
+        if not self.winfo_exists():
+            return  # window closed while the probe was in flight
+        if detected is not None:
+            # Only a definite answer is cached. "Could not determine" (offline, server down) must
+            # be re-probed later rather than remembered as "not behind Cloudflare".
+            self._cloudflare_by_url[base_url] = detected
+        if base_url != self._webapi_url_entry.get().strip():
+            return  # the user has moved on to a different server since this probe started
+        self._render_cloudflare_warning(bool(detected), _safe_int(self._webapi_chunk_entry.get(), 50))
+
+    def _render_cloudflare_warning(self, behind_cloudflare: bool, chunk_mb: int) -> None:
+        if not behind_cloudflare or chunk_mb <= cloudflare.SAFE_CHUNK_MB:
+            self._hide_cloudflare_warning()
+            return
+
+        self._cloudflare_warning.set_text(
+            f"⚠  This server appears to be behind Cloudflare, which rejects a single upload larger "
+            f"than {cloudflare.MAX_UPLOAD_MB}MB. A chunk size of {chunk_mb}MB will likely fail with "
+            f"a 413 error - {cloudflare.SAFE_CHUNK_MB}MB or lower is safe."
+        )
+        self._cloudflare_warning.pack(anchor="w", pady=(4, 0))
+
+    def _hide_cloudflare_warning(self) -> None:
+        self._cloudflare_warning.pack_forget()
 
     def _prompt_for_mfa_code(self) -> str | None:
         """Called from a background worker thread (Test Connection / Fetch Folders); shows the
