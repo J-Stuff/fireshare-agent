@@ -56,11 +56,13 @@ class TrayIcon:
         has_update: Callable[[], bool] = lambda: False,
         update_version: Callable[[], str] = lambda: "",
         on_update_now: Callable[[], None] = lambda: None,
+        pending_review_count: Callable[[], int] = lambda: 0,
     ) -> None:
         self._is_paused = is_paused
         self._has_failures = has_failures
         self._has_update = has_update
         self._update_version = update_version
+        self._pending_review_count = pending_review_count
         self._on_exit = on_exit
 
         self.icon = pystray.Icon(
@@ -72,6 +74,11 @@ class TrayIcon:
                     lambda item: f"Update to {self._update_version()} Now",
                     lambda: on_update_now(),
                     visible=lambda item: self._has_update(),
+                ),
+                pystray.MenuItem(
+                    lambda item: f"Review {self._pending_review_count()} File(s)...",
+                    lambda: on_open_activity(),
+                    visible=lambda item: self._pending_review_count() > 0,
                 ),
                 pystray.MenuItem("Open Settings", lambda: on_open_settings()),
                 pystray.MenuItem("View Activity / Log", lambda: on_open_activity()),

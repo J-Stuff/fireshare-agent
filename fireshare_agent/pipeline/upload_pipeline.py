@@ -9,12 +9,13 @@ import os
 import queue
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
 from fireshare_agent.config.app_config import AppConfig
 from fireshare_agent.manifest import fingerprint
-from fireshare_agent.manifest.store import ManifestStore
+from fireshare_agent.manifest.store import ManifestEntry, ManifestStore
 from fireshare_agent.models import MediaKind, PendingFile, PostUploadAction
 from fireshare_agent.pipeline.activity import PipelineActivity, PipelineEventKind
 from fireshare_agent.uploaders.base import Uploader
@@ -26,6 +27,23 @@ _NOT_READY_RETRY_DELAY_SECONDS = 15.0
 _MAX_WAIT_FOR_READY_SECONDS = 24 * 60 * 60  # a file that never stabilizes after 24h is abandoned
 _MAX_RETRY_BACKOFF_SECONDS = 30 * 60
 _UPLOAD_METHOD_LABEL = "web_api"  # recorded in the manifest DB for historical/debugging purposes
+
+
+@dataclass(frozen=True)
+class ReviewOutcome:
+    """What actually happened when the user's decision about a reviewed file was carried out.
+    `resolved` means the row should stop appearing in the review list; a failure that the user
+    could retry (a locked file, say) should leave it unresolved so the entry stays put."""
+    resolved: bool
+    message: str
+
+    @staticmethod
+    def done(message: str) -> "ReviewOutcome":
+        return ReviewOutcome(True, message)
+
+    @staticmethod
+    def failed(message: str) -> "ReviewOutcome":
+        return ReviewOutcome(False, message)
 
 
 class UploadPipeline:
@@ -70,6 +88,21 @@ class UploadPipeline:
     @property
     def failed_count(self) -> int:
         return self._manifest.get_failed_count()
+
+    @property
+    def pending_review_count(self) -> int:
+        return self._manifest.get_pending_review_count()
+
+    def get_pending_review(self) -> list[ManifestEntry]:
+        return self._manifest.get_pending_review()
+
+    def resolve_pending_review(self, entry: ManifestEntry, action: PostUploadAction) -> ReviewOutcome:
+        """Applies the user's decision about the local copy of a file that was matched to a
+        server-side file by name alone. Called from the UI thread, not the upload worker - it
+        touches only this one file and the manifest row for it, both of which the worker has
+        already finished with by the time a row becomes reviewable."""
+        # TODO(human): decide what happens for each outcome and return the matching ReviewOutcome.
+        ...
 
     def start(self) -> None:
         self._stop_event.clear()
@@ -211,10 +244,21 @@ class UploadPipeline:
             # Best-effort check against the actual destination (not just our local history) -
             # covers a lost/fresh-install manifest, or a file that was already uploaded some
             # other way.
+            #
+            # Deliberately does NOT run the post-upload action: this match is inferred from the
+            # filename alone (Fireshare exposes no size or content hash to verify against), so
+            # acting on it would mean moving - or, with the delete action configured, permanently
+            # destroying - a local file that may never have been uploaded at all. Instead the row
+            # is flagged for review and the user decides per file; see
+            # WebApiUploader.exists_at_destination and resolve_pending_review below.
             if uploader.exists_at_destination(pending_file):
-                self._manifest.record_already_existed(fp, path, size_bytes, _UPLOAD_METHOD_LABEL)
-                self._apply_post_upload_action(path)
-                self._raise_activity(path, kind, PipelineEventKind.ALREADY_AT_DESTINATION)
+                self._manifest.record_already_existed(
+                    fp, path, size_bytes, _UPLOAD_METHOD_LABEL, pending_review=True
+                )
+                self._raise_activity(
+                    path, kind, PipelineEventKind.ALREADY_AT_DESTINATION,
+                    "Matched an existing file on the server by name - waiting for your review",
+                )
                 return True
 
             self._raise_activity(path, kind, PipelineEventKind.UPLOADING)
@@ -275,23 +319,27 @@ class UploadPipeline:
 
     def _apply_post_upload_action(self, path: str) -> None:
         try:
-            action = self._config.post_upload_action
-            if action == PostUploadAction.LEAVE.value:
-                return
-            if action == PostUploadAction.MOVE_TO_SUBFOLDER.value:
-                directory = os.path.dirname(path)
-                subfolder = os.path.join(directory, self._config.move_to_subfolder_name)
-                os.makedirs(subfolder, exist_ok=True)
-                destination = _non_conflicting_path(os.path.join(subfolder, os.path.basename(path)))
-                os.replace(path, destination)
-                return
-            if action == PostUploadAction.DELETE.value:
-                os.remove(path)
-                return
-        except OSError:
+            self.perform_local_action(path, PostUploadAction(self._config.post_upload_action))
+        except (OSError, ValueError):
             # The upload already succeeded and is recorded; a local housekeeping failure
             # (e.g. destination locked) shouldn't be treated as an upload failure.
             pass
+
+    def perform_local_action(self, path: str, action: PostUploadAction) -> None:
+        """Carries out one local file action, raising OSError if it fails. Shared by the
+        automatic post-upload path (which swallows failures) and the review flow (which reports
+        them back to the user), so both apply identical move/delete semantics."""
+        if action == PostUploadAction.LEAVE:
+            return
+        if action == PostUploadAction.MOVE_TO_SUBFOLDER:
+            directory = os.path.dirname(path)
+            subfolder = os.path.join(directory, self._config.move_to_subfolder_name)
+            os.makedirs(subfolder, exist_ok=True)
+            destination = _non_conflicting_path(os.path.join(subfolder, os.path.basename(path)))
+            os.replace(path, destination)
+            return
+        if action == PostUploadAction.DELETE:
+            os.remove(path)
 
     def _resolve_kind(self, path: str) -> MediaKind | None:
         ext = Path(path).suffix.lower()

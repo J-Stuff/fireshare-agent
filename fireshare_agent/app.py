@@ -61,6 +61,7 @@ class FireshareAgentApp:
             has_update=lambda: self._update_info is not None,
             update_version=lambda: self._update_info.version if self._update_info else "",
             on_update_now=lambda: self.run_on_ui_thread(self.confirm_and_apply_update),
+            pending_review_count=lambda: self.pipeline.pending_review_count,
         )
         tray_thread = threading.Thread(target=self.tray.run, daemon=True, name="fireshare-agent-tray")
         tray_thread.start()
@@ -89,7 +90,7 @@ class FireshareAgentApp:
             self.activity_window.lift()
             self.activity_window.focus_force()
             return
-        self.activity_window = ActivityWindow(self.root, self.manifest)
+        self.activity_window = ActivityWindow(self.root, self.manifest, self.pipeline)
 
     def _on_settings_saved(self, new_config: AppConfig) -> None:
         self.config = new_config
@@ -164,14 +165,19 @@ class FireshareAgentApp:
         level = logging.DEBUG if activity.event_kind == PipelineEventKind.WAITING else logging.INFO
         log.log(level, "%s: %s%s", activity.event_kind.value, activity.path, f" ({activity.message})" if activity.message else "")
 
-        if self.tray and activity.event_kind in (PipelineEventKind.SUCCEEDED, PipelineEventKind.FAILED):
+        if self.tray and activity.event_kind in (
+            PipelineEventKind.SUCCEEDED, PipelineEventKind.FAILED, PipelineEventKind.ALREADY_AT_DESTINATION,
+        ):
             self.run_on_ui_thread(self.tray.refresh)
 
         if self.config.show_upload_notifications and self.tray:
             if activity.event_kind == PipelineEventKind.SUCCEEDED:
                 self._notify(f"Uploaded {_short_name(activity.path)}")
             elif activity.event_kind == PipelineEventKind.ALREADY_AT_DESTINATION:
-                self._notify(f"Already on Fireshare, skipped: {_short_name(activity.path)}")
+                self._notify(
+                    f"Already on Fireshare: {_short_name(activity.path)} - open the tray menu to "
+                    "review what happens to the local copy."
+                )
             elif activity.event_kind == PipelineEventKind.FAILED:
                 self._notify(f"Failed to upload {_short_name(activity.path)}: {activity.message}")
 
