@@ -14,6 +14,7 @@ import time
 import pytest
 
 from fireshare_agent.config.app_config import AppConfig, WatchFolderConfig
+from fireshare_agent.manifest import fingerprint
 from fireshare_agent.manifest.store import ManifestStore
 from fireshare_agent.models import PostUploadAction, UploadResult
 from fireshare_agent.pipeline import upload_pipeline
@@ -466,3 +467,196 @@ def test_pause_still_applies_when_it_cannot_be_persisted(tmp_path, monkeypatch):
     pipeline.pause()
 
     assert pipeline.is_paused is True
+
+
+# --- Startup rescan must not pay the 3s readiness sleep for already-uploaded files -------------
+#
+# is_ready() sleeps unconditionally for its stable-size window, and it used to run *before* the
+# manifest lookup. With the default post_upload_action = LEAVE every uploaded file stays in the
+# watch folder and is re-walked by sync_now() on every launch, so a few hundred clips meant many
+# minutes of pure sleeping (plus a discarded head/tail read each) before the first genuinely new
+# file was even looked at. The dedupe check must come first.
+
+
+def _explode_if_called(path):  # pragma: no cover - the assertion is the point
+    raise AssertionError("is_ready() must not be called for an already-handled file")
+
+
+def test_already_uploaded_file_skips_the_readiness_sleep_entirely(tmp_path, monkeypatch):
+    pipeline = _pipeline(tmp_path)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"already uploaded contents")
+    size = clip.stat().st_size
+    pipeline._manifest.record_success(fingerprint.compute(str(clip), size), str(clip), size, "web_api")
+
+    monkeypatch.setattr(upload_pipeline, "is_ready", _explode_if_called)
+    activities = []
+    pipeline.add_activity_listener(activities.append)
+
+    resolved = pipeline._process_candidate(str(clip))
+
+    assert resolved is True
+    assert activities[-1].event_kind == PipelineEventKind.SKIPPED_DUPLICATE
+
+
+def test_file_matched_to_the_server_and_awaiting_review_also_skips_readiness(tmp_path, monkeypatch):
+    # record_already_existed(pending_review=True) counts as handled: the file is on the server
+    # either way, so a rescan must not re-probe it while the user takes their time deciding.
+    pipeline = _pipeline(tmp_path)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"on the server already")
+    size = clip.stat().st_size
+    pipeline._manifest.record_already_existed(
+        fingerprint.compute(str(clip), size), str(clip), size, "web_api", pending_review=True
+    )
+
+    monkeypatch.setattr(upload_pipeline, "is_ready", _explode_if_called)
+
+    assert pipeline._process_candidate(str(clip)) is True
+
+
+def test_a_previously_failed_file_still_goes_through_the_readiness_probe(tmp_path, monkeypatch):
+    # Only success/already-existed count as handled - a failed row must not be short-circuited,
+    # or a retry would never reach the uploader again.
+    pipeline = _pipeline(tmp_path)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"failed last time")
+    size = clip.stat().st_size
+    pipeline._manifest.record_failure(
+        fingerprint.compute(str(clip), size), str(clip), size, "web_api", "boom"
+    )
+
+    calls = []
+
+    def _record_ready(path):
+        calls.append(path)
+        return True
+
+    monkeypatch.setattr(upload_pipeline, "is_ready", _record_ready)
+    fake_uploader = _FakeUploader([UploadResult.ok()])
+    monkeypatch.setattr(pipeline, "_get_or_create_uploader", lambda: fake_uploader)
+
+    assert pipeline._process_candidate(str(clip)) is True
+    assert calls == [str(clip)]
+    assert fake_uploader.call_count == 1
+
+
+def test_a_new_file_is_still_readiness_checked_before_upload(tmp_path, monkeypatch):
+    # The pre-check must not become a way to upload a file that is still being written.
+    pipeline = _pipeline(tmp_path)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"brand new, still growing")
+
+    def _never(*args, **kwargs):  # pragma: no cover - the assertion is the point
+        raise AssertionError("a not-ready file must never reach the uploader")
+
+    monkeypatch.setattr(upload_pipeline, "is_ready", lambda path: False)
+    monkeypatch.setattr(pipeline, "_get_or_create_uploader", _never)
+
+    pipeline._in_flight[str(clip)] = time.monotonic()
+    try:
+        assert pipeline._process_candidate(str(clip)) is False
+    finally:
+        pipeline.stop()
+
+
+def test_a_mid_write_file_does_not_match_the_finished_file_fingerprint(tmp_path, monkeypatch):
+    # The safety property the reordering rests on: the size is part of the fingerprint string,
+    # so a partially written file cannot collide with the completed file's manifest row.
+    pipeline = _pipeline(tmp_path)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"the complete finished recording")
+    size = clip.stat().st_size
+    pipeline._manifest.record_success(fingerprint.compute(str(clip), size), str(clip), size, "web_api")
+
+    clip.write_bytes(b"the complete")  # rewind to a partially written state
+    monkeypatch.setattr(upload_pipeline, "is_ready", lambda path: False)
+
+    pipeline._in_flight[str(clip)] = time.monotonic()
+    try:
+        # Not short-circuited as a duplicate: it falls through to the readiness path unchanged.
+        assert pipeline._process_candidate(str(clip)) is False
+    finally:
+        pipeline.stop()
+
+
+def test_an_unreadable_file_falls_through_instead_of_failing(tmp_path, monkeypatch):
+    # A file the recorder still holds open exclusively raises PermissionError (an OSError) from
+    # the pre-check's open(). That must be absorbed here - letting it reach the worker's generic
+    # catch would mark a live recording permanently FAILED.
+    pipeline = _pipeline(tmp_path)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"held open by the recorder")
+
+    def _locked(path, size_bytes):
+        raise PermissionError(13, "The process cannot access the file")
+
+    monkeypatch.setattr(upload_pipeline.fingerprint, "compute", _locked)
+    monkeypatch.setattr(upload_pipeline, "is_ready", lambda path: False)
+
+    activities = []
+    pipeline.add_activity_listener(activities.append)
+    pipeline._in_flight[str(clip)] = time.monotonic()
+    try:
+        assert pipeline._process_candidate(str(clip)) is False
+        assert activities[-1].event_kind == PipelineEventKind.WAITING
+    finally:
+        pipeline.stop()
+
+
+def test_a_zero_byte_file_is_left_to_the_readiness_probe(tmp_path):
+    # A recorder that has created the file but written nothing yet: nothing worth hashing, and
+    # is_ready() already rejects size 0 on its own.
+    pipeline = _pipeline(tmp_path)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"")
+
+    assert pipeline._try_compute_fingerprint(str(clip)) is None
+
+
+def test_a_vanished_file_yields_no_fingerprint_rather_than_raising(tmp_path):
+    pipeline = _pipeline(tmp_path)
+
+    assert pipeline._try_compute_fingerprint(str(tmp_path / "gone.mp4")) is None
+
+
+def test_the_fingerprint_is_not_recomputed_when_the_size_held_steady(tmp_path, monkeypatch):
+    # The pre-check's hash is reused after a passing readiness probe, so a new file costs one
+    # head/tail read in total rather than two.
+    pipeline = _pipeline(tmp_path)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"a brand new recording")
+
+    real_compute = fingerprint.compute
+    calls = []
+
+    def _counted(path, size_bytes):
+        calls.append(path)
+        return real_compute(path, size_bytes)
+
+    monkeypatch.setattr(upload_pipeline.fingerprint, "compute", _counted)
+    monkeypatch.setattr(upload_pipeline, "is_ready", lambda path: True)
+    monkeypatch.setattr(pipeline, "_get_or_create_uploader", lambda: _FakeUploader([UploadResult.ok()]))
+
+    assert pipeline._process_candidate(str(clip)) is True
+    assert len(calls) == 1
+
+
+def test_the_fingerprint_is_recomputed_when_the_file_grew_during_the_probe(tmp_path, monkeypatch):
+    # If the file changed size between the pre-check and a passing readiness probe, the stored
+    # fingerprint must describe what was actually uploaded, not the earlier partial state.
+    pipeline = _pipeline(tmp_path)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"partial")
+
+    def _grow_then_ready(path):
+        clip.write_bytes(b"partial plus the rest of the recording")
+        return True
+
+    monkeypatch.setattr(upload_pipeline, "is_ready", _grow_then_ready)
+    monkeypatch.setattr(pipeline, "_get_or_create_uploader", lambda: _FakeUploader([UploadResult.ok()]))
+
+    assert pipeline._process_candidate(str(clip)) is True
+
+    final_fp = fingerprint.compute(str(clip), clip.stat().st_size)
+    assert pipeline._manifest.is_already_handled(final_fp) is True

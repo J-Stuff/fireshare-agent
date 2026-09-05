@@ -264,6 +264,21 @@ class UploadPipeline:
             retrying = self._retry_state.get(path)
 
         if retrying is None:
+            # The manifest check runs *before* the readiness probe, not after it. is_ready()
+            # sleeps 3s unconditionally as its stable-size window, and with the default
+            # post_upload_action = LEAVE every previously-uploaded file stays in the watch folder
+            # and is re-walked by sync_now() on every launch - a few hundred clips is that many
+            # multiples of 3s spent sleeping before the first new file is even looked at.
+            #
+            # Safe to do first because the size is part of the fingerprint string: a file still
+            # being written is a different size from the finished file it will become, so it
+            # cannot match a stored fingerprint and simply falls through to the readiness path
+            # below, exactly as before.
+            precomputed = self._try_compute_fingerprint(path)
+            if precomputed is not None and self._manifest.is_already_handled(precomputed[1]):
+                self._raise_activity(path, kind, PipelineEventKind.SKIPPED_DUPLICATE)
+                return True
+
             if not is_ready(path):
                 with self._in_flight_lock:
                     first_seen = self._in_flight.get(path, time.monotonic())
@@ -280,7 +295,13 @@ class UploadPipeline:
                 return False
 
             size_bytes = os.path.getsize(path)
-            fp = fingerprint.compute(path, size_bytes)
+            if precomputed is not None and precomputed[0] == size_bytes:
+                # Same size as the pre-check moments ago, and is_ready() has just confirmed the
+                # size held steady across its own window too - re-reading a megabyte from each
+                # end of the file would only reproduce the hash we already have.
+                fp = precomputed[1]
+            else:
+                fp = fingerprint.compute(path, size_bytes)
 
             if self._manifest.is_already_handled(fp):
                 self._raise_activity(path, kind, PipelineEventKind.SKIPPED_DUPLICATE)
@@ -344,6 +365,21 @@ class UploadPipeline:
         self._raise_activity(path, kind, PipelineEventKind.WAITING, f"Upload attempt {attempts_made} failed ({error}); retrying in {int(backoff)}s")
         self._schedule_requeue(path, backoff)
         return False
+
+    def _try_compute_fingerprint(self, path: str) -> tuple[int, str] | None:
+        """(size, fingerprint) for a file that can be read right now, or None if it can't be.
+
+        None means "unknown", and callers fall through to the normal readiness path - it is not a
+        failure. The file may have been moved between the walk and here, or still be held
+        exclusively by the recorder that is writing it; letting either OSError escape to the
+        worker's generic catch would mark a perfectly good recording as FAILED."""
+        try:
+            size_bytes = os.path.getsize(path)
+            if size_bytes == 0:
+                return None  # a placeholder the recorder has only just created; nothing to hash
+            return size_bytes, fingerprint.compute(path, size_bytes)
+        except OSError:
+            return None
 
     def _clear_retry_state(self, path: str) -> None:
         with self._retry_state_lock:
