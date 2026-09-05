@@ -142,6 +142,29 @@ def test_remote_folder_hint_is_none_outside_any_watch_folder(tmp_path):
     assert pipeline._compute_remote_folder_hint(str(clip)) is None
 
 
+def test_sync_now_skips_the_post_upload_subfolder(tmp_path, monkeypatch):
+    # Regression test: after a "move to subfolder" upload, that subfolder sits inside the same
+    # recursively-watched tree. Without pruning it, every rescan (Sync Now, or the startup sync)
+    # would walk back into it and re-hash every already-uploaded file there forever.
+    capture_root = tmp_path / "recordings"
+    game_dir = capture_root / "SomeGame"
+    uploaded_dir = game_dir / "Uploaded"
+    uploaded_dir.mkdir(parents=True)
+    (game_dir / "new_clip.mp4").write_bytes(b"x")
+    (uploaded_dir / "old_clip.mp4").write_bytes(b"x")
+
+    manifest = ManifestStore(str(tmp_path / "manifest.db"))
+    config = AppConfig(watch_folders=[WatchFolderConfig(path=str(capture_root))], move_to_subfolder_name="Uploaded")
+    pipeline = UploadPipeline(manifest, config)
+
+    enqueued = []
+    monkeypatch.setattr(pipeline, "_enqueue", enqueued.append)
+
+    pipeline.sync_now()
+
+    assert enqueued == [str(game_dir / "new_clip.mp4")]
+
+
 def test_remote_folder_hint_normalizes_nested_paths_to_forward_slashes(tmp_path):
     capture_root = tmp_path / "recordings"
     nested_dir = capture_root / "Game" / "Highlights"

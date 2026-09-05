@@ -67,7 +67,10 @@ class UploadPipeline:
 
     def start(self) -> None:
         self._stop_event.clear()
-        self._watcher.start(self._config.watch_folders, self._config.video_extensions, self._config.image_extensions, self._enqueue)
+        self._watcher.start(
+            self._config.watch_folders, self._config.video_extensions, self._config.image_extensions,
+            self._enqueue, self._config.move_to_subfolder_name,
+        )
         self._worker_thread = threading.Thread(target=self._run_worker, daemon=True, name="fireshare-agent-upload-worker")
         self._worker_thread.start()
 
@@ -94,7 +97,10 @@ class UploadPipeline:
         self._config = config
         with self._uploader_lock:
             self._active_uploader = None
-        self._watcher.start(self._config.watch_folders, self._config.video_extensions, self._config.image_extensions, self._enqueue)
+        self._watcher.start(
+            self._config.watch_folders, self._config.video_extensions, self._config.image_extensions,
+            self._enqueue, self._config.move_to_subfolder_name,
+        )
 
     def sync_now(self) -> None:
         """Walks all watch folders now and enqueues anything not already recorded as uploaded."""
@@ -110,7 +116,14 @@ class UploadPipeline:
                 except OSError:
                     walker = []
 
-            for root, _dirs, files in walker:
+            for root, dirs, files in walker:
+                if folder.recursive:
+                    # Prune the post-upload destination subfolder (at any depth, e.g. also under
+                    # a mirrored per-game subfolder) so already-uploaded files that were moved
+                    # there don't get walked, re-hashed, and re-checked against the manifest on
+                    # every rescan.
+                    dirs[:] = [d for d in dirs if d.lower() != self._config.move_to_subfolder_name.lower()]
+
                 for name in files:
                     full_path = os.path.join(root, name)
                     kind = self._resolve_kind(full_path)
