@@ -2,6 +2,34 @@
 
 <!-- version list -->
 
+## v1.3.0 (2026-09-05)
+
+### Bug Fixes
+
+- Background process bugs
+  ([`a37a56a`](https://github.com/J-Stuff/fireshare-agent/commit/a37a56ae733547373d5049a5454a836346f929ae))
+
+- Bug where saving Settings silently un-pauses a paused agent
+  ([`a37a56a`](https://github.com/J-Stuff/fireshare-agent/commit/a37a56ae733547373d5049a5454a836346f929ae))
+
+- Chunk size and retry backoff accept 0 and negative values
+  ([`a37a56a`](https://github.com/J-Stuff/fireshare-agent/commit/a37a56ae733547373d5049a5454a836346f929ae))
+
+- Finish deletion on an inferred server-side match patch
+  ([`a37a56a`](https://github.com/J-Stuff/fireshare-agent/commit/a37a56ae733547373d5049a5454a836346f929ae))
+
+- Startup rescan sleeps 3 seconds per already-uploaded file
+  ([`a37a56a`](https://github.com/J-Stuff/fireshare-agent/commit/a37a56ae733547373d5049a5454a836346f929ae))
+
+- Sync Now from tray icon blocks the tray thread
+  ([`a37a56a`](https://github.com/J-Stuff/fireshare-agent/commit/a37a56ae733547373d5049a5454a836346f929ae))
+
+### Features
+
+- Add CloudFlare detection when setting upload chunk size to notify user if setting is set too high
+  ([`a37a56a`](https://github.com/J-Stuff/fireshare-agent/commit/a37a56ae733547373d5049a5454a836346f929ae))
+
+
 ## v1.2.0 (2026-09-05)
 
 ### Bug Fixes
