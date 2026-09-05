@@ -26,86 +26,67 @@ instance.
   it.
 - Your Fireshare password is stored in Windows Credential Manager, never in the config file.
 - Checks GitHub Releases for a newer version on startup (configurable) and lets you update from
-  the tray menu with one click - it downloads the new build, verifies its checksum, and relaunches
-  itself automatically. Only active in the packaged build; a no-op when running from source.
+  the tray menu with one click - see [Updating](#updating) below.
 
-## Requirements
+## Installation
 
-- Windows 10/11
-- Python 3.11+ (only if running/building from source - the packaged build has no prerequisites)
+Requires Windows 10 or 11.
 
-## Running from source
+1. Grab the latest `FireshareAgent-Setup-<version>.exe` from the
+   [Releases page](https://github.com/J-Stuff/fireshare-agent/releases/latest).
+2. Run it. You'll be asked to choose:
+   - **Install for me only** (default) - no admin rights needed, installs under your user profile.
+   - **Install for all users** - requires admin rights, installs under `Program Files`.
+3. The app launches automatically once installed, minimized to the system tray - it has no
+   visible window on startup.
 
-```powershell
-py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-.\.venv\Scripts\python.exe main.py
-```
+The installer isn't code-signed, so Windows SmartScreen may show an "unrecognized app" warning the
+first time you run it. Click **More info**, then **Run anyway** to proceed.
 
-Settings are stored at `%AppData%\FireshareAgent\config.json` (secrets excluded), the dedupe
-manifest at `%AppData%\FireshareAgent\manifest.db`, and logs at
-`%AppData%\FireshareAgent\agent.log`.
+## First-time setup
 
-## Building a distributable
+The app does nothing until you tell it what to watch and where to upload. Right-click the tray
+icon and choose **Open Settings**:
 
-```powershell
-.\.venv\Scripts\python.exe -m PyInstaller packaging\fireshare_agent.spec --noconfirm
-```
+- **General** tab: add one or more folders to watch (e.g. your ShadowPlay clips/screenshots
+  folder) and choose what happens to a file after it's uploaded (leave it, move it to a subfolder,
+  or delete it).
+- **Fireshare Account** tab: enter your Fireshare server URL, username, and password, then click
+  **Test Connection** to confirm it works before saving.
+- **Advanced** tab: startup, notification, and update-check preferences.
 
-Produces a self-contained folder at `dist\FireshareAgent\` (onedir build - no Python install
-required on the target machine). Run `dist\FireshareAgent\FireshareAgent.exe`.
+Click **Save** and the agent starts watching immediately - no restart needed. Right-click the tray
+icon any time to check upload status (**View Activity / Log**), trigger an immediate scan
+(**Sync Now**), or pause watching.
 
-## Tests
+## Updating
 
-```powershell
-.\.venv\Scripts\python.exe -m pytest tests
-```
+By default, the app checks GitHub for a newer release on startup and shows a tray notification
+plus an "Update to \<version\> Now" item in the tray menu when one's available. Clicking it asks
+you to confirm, then downloads and verifies the new installer and runs it silently - it closes the
+app, replaces its files, and relaunches it automatically. If you installed for all users, you'll
+see a Windows admin (UAC) prompt as part of that, since updating files under `Program Files`
+requires it.
 
-## Releases & versioning
+You can also check manually via **Open Settings > Advanced > Check for Updates Now**, or just
+download and run a newer installer from the Releases page yourself at any time.
 
-Versioning and releases are fully automatic - there's no manual tagging step. On every push to
-`main`:
+## Where your data lives
 
-1. `.github/workflows/release.yml`'s `test` job runs the test suite.
-2. Its `version` job runs [python-semantic-release](https://python-semantic-release.readthedocs.io/),
-   which looks at every commit since the last release, classifies each by its
-   [Conventional Commits](https://www.conventionalcommits.org/) prefix, and takes the single
-   highest-impact bump among them (ten `fix:` commits still only bump patch once, not ten times):
+Regardless of install mode, your settings, upload history, and logs live in your own user
+profile - never under `Program Files`, even for an all-users install:
 
-   | Commit prefix | Bump |
-   |---|---|
-   | `fix:`, `perf:` | patch (`0.1.0` -> `0.1.1`) |
-   | `feat:` | minor (`0.1.0` -> `0.2.0`) |
-   | `feat!:` / `fix!:` (or any type with `!`), or a `BREAKING CHANGE:` footer | major (`0.1.0` -> `1.0.0`) |
-   | `chore:`, `docs:`, `style:`, `refactor:`, `test:`, `build:`, `ci:` | none - allowed, but never trigger a release by themselves |
+- Settings: `%AppData%\FireshareAgent\config.json` (your Fireshare password is not in this file)
+- Upload history (dedupe manifest): `%AppData%\FireshareAgent\manifest.db`
+- Logs: `%AppData%\FireshareAgent\agent.log`
+- Password / saved session: Windows Credential Manager
 
-   **Commit messages on `main` need to use one of these prefixes.** If every commit since the
-   last release is from that bottom row (or doesn't follow the convention at all), this job's
-   `released` output is `false` and nothing below it runs - that push is a no-op for releases,
-   though `.github/workflows/ci.yml` still runs the test suite on every push and PR regardless.
-3. If a release was warranted, it bumps `fireshare_agent/__init__.py`'s `__version__` and
-   `pyproject.toml`'s version, generates a changelog, tags it, and publishes a GitHub Release.
-4. The `build` job then checks out that new tag, builds the Windows executable on a
-   `windows-latest` runner, and attaches the zipped build plus a `.sha256` checksum file to the
-   release that was just published.
-
-**Breaking changes while the version is still `0.x`**: `pyproject.toml` doesn't override
-`major_on_zero`, so it's at PSR's default of `true` - a single breaking-change commit (`feat!:`,
-`fix!:`, or a `BREAKING CHANGE:` footer) right now would jump straight from `0.x.y` to `1.0.0`,
-same as it would from any other version. If you'd rather stay in `0.x` through breaking changes
-during early development and only reach `1.0.0` deliberately, set
-`major_on_zero = false` under `[tool.semantic_release]` in `pyproject.toml` - breaking changes
-then bump minor instead while the major version is `0`.
+Uninstalling (via **Settings > Apps**, or the shortcut in the Start Menu folder) removes the
+installed program files but leaves the above in place, so reinstalling later picks up where you
+left off. Delete the `%AppData%\FireshareAgent` folder yourself if you want a clean slate.
 
 ## Notes
 
-- Fireshare's chunked upload endpoint doesn't validate the checksum field against file content -
-  it's only used server-side to group chunk parts for one upload, so the agent sends a random
-  per-upload token rather than a real file hash.
-- The server-side duplicate check matches on filename (normalized, case/punctuation-insensitive)
-  and extension, not a content hash - Fireshare's API doesn't expose file size or a hash for
-  existing videos/images. It's deliberately conservative: if it can't get a clear answer (network
-  hiccup, etc.), it lets the upload proceed rather than risk skipping a genuinely new file.
 - MFA-enabled Fireshare accounts are supported on a best-effort basis: if the server asks for a
   TOTP code mid-upload, the app pauses that upload and prompts you for the current code. This is
   inherently a manual step for what's otherwise an unattended background service - but it only
@@ -119,17 +100,17 @@ then bump minor instead while the major version is `0`.
   saved one) whenever the container restarts. Setting `SECRET_KEY` to a fixed value in your
   Fireshare `docker-compose.yml` avoids that, so a routine container restart doesn't cost you a
   TOTP prompt.
-- Each chunk of a video upload is sent under an identifier derived from the file's path and size,
-  not a random one per attempt - so if an upload fails partway and gets retried, it resends into
-  the same in-progress group on the server instead of abandoning the chunks already sent (which
-  Fireshare only cleans up on a successful reassembly or a server restart, otherwise leaving them
-  on disk indefinitely).
-- The self-updater downloads the new build's zip and, if the release published a `.sha256`
-  alongside it, verifies the checksum before touching anything - a mismatch aborts with an error
-  and the currently-installed files are left untouched. Since a running exe can't overwrite its
-  own files, applying an update hands off to a small generated PowerShell script that waits for
-  this process to exit, mirrors the new files over the install directory, relaunches the app, and
-  deletes itself.
+
+## Development
+
+Looking to run this from source, build the installer yourself, or understand how releases and
+auto-updates are wired up? See [docs/](docs/):
+
+- [docs/development.md](docs/development.md) - running from source, building the installer,
+  running tests.
+- [docs/releasing.md](docs/releasing.md) - how automatic versioning and GitHub Releases work.
+- [docs/technical-notes.md](docs/technical-notes.md) - implementation notes on the upload protocol
+  and the self-updater.
 
 ## License
 

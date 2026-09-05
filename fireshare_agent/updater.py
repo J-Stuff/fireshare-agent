@@ -1,7 +1,9 @@
 """
-Checks GitHub Releases for a newer version and, if the user confirms, downloads it and hands off
-to a small generated PowerShell script that waits for this process to exit, replaces the
-installed files, and relaunches - a running Windows exe can't overwrite its own files directly.
+Checks GitHub Releases for a newer version and, if the user confirms, downloads the installer
+built for that release and runs it silently, handing off control to it - a running Windows exe
+can't overwrite its own files directly. The installer (packaging/installer.iss) closes this app,
+replaces its files, and relaunches it, whether it's installed per-machine (Program Files, which
+needs the installer to self-elevate via UAC) or per-user (AppData, no elevation needed).
 
 Only meaningful for the packaged (frozen) build; check_for_update() is a no-op when running from
 source, since there's no installed exe directory to update in place.
@@ -11,10 +13,8 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-import shutil
 import subprocess
 import sys
-import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -74,56 +74,57 @@ def check_for_update(timeout: float = 10.0) -> UpdateInfo | None:
         return None
 
     assets = data.get("assets") or []
-    zip_asset = next((a for a in assets if a.get("name", "").endswith(".zip")), None)
-    if zip_asset is None:
+    installer_asset = next((a for a in assets if a.get("name", "").lower().endswith(".exe")), None)
+    if installer_asset is None:
         return None
-    checksum_asset = next((a for a in assets if a.get("name") == zip_asset["name"] + ".sha256"), None)
+    checksum_asset = next((a for a in assets if a.get("name") == installer_asset["name"] + ".sha256"), None)
 
     return UpdateInfo(
         version=tag.lstrip("vV"),
         tag=tag,
-        download_url=zip_asset["browser_download_url"],
+        download_url=installer_asset["browser_download_url"],
         checksum_url=checksum_asset["browser_download_url"] if checksum_asset else None,
         notes_url=data.get("html_url") or f"https://github.com/{_REPO}/releases/latest",
     )
 
 
 def apply_update(info: UpdateInfo, on_exit: Callable[[], None]) -> None:
-    """Downloads the release zip, verifies its checksum if one was published, extracts it,
-    writes a relaunch script, launches that script detached, then calls on_exit() to quit this
-    process and hand off control. Raises on failure (download error, checksum mismatch) so the
-    caller can show that to the user - nothing has touched the installed files at that point."""
+    """Downloads the release installer, verifies its checksum if one was published, then launches
+    it silently and calls on_exit() to quit this process and hand off control. Raises on failure
+    (download error, checksum mismatch) so the caller can show that to the user - nothing has
+    touched the installed files at that point.
+
+    Passes /CURRENTUSER or /ALLUSERS matching how this install was originally set up, so the
+    installer repeats that choice instead of prompting for it again on what's meant to be an
+    unattended update."""
     install_dir = Path(sys.executable).resolve().parent
     staging_dir = app_data_dir() / "update" / info.version
     staging_dir.mkdir(parents=True, exist_ok=True)
-    zip_path = staging_dir / "update.zip"
+    installer_path = staging_dir / "FireshareAgentSetup.exe"
 
-    _download_file(info.download_url, zip_path)
+    _download_file(info.download_url, installer_path)
 
     if info.checksum_url:
         expected = _download_text(info.checksum_url).split()[0].strip().lower()
-        actual = _sha256(zip_path).lower()
+        actual = _sha256(installer_path).lower()
         if expected and expected != actual:
             raise RuntimeError("Downloaded update failed checksum verification - aborting.")
 
-    extracted_dir = staging_dir / "extracted"
-    if extracted_dir.exists():
-        shutil.rmtree(extracted_dir)
-    with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(extracted_dir)
-
-    script_path = staging_dir / "apply_update.ps1"
-    script_path.write_text(
-        _relaunch_script(pid=os.getpid(), source_dir=extracted_dir, install_dir=install_dir, staging_dir=staging_dir),
-        encoding="utf-8",
-    )
-
+    mode_flag = "/ALLUSERS" if _is_all_users_install(install_dir) else "/CURRENTUSER"
     subprocess.Popen(
-        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", str(script_path)],
+        [str(installer_path), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/FORCECLOSEAPPLICATIONS", mode_flag],
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
         close_fds=True,
     )
     on_exit()
+
+
+def _is_all_users_install(install_dir: Path) -> bool:
+    """True if installed to a machine-wide location (Program Files) rather than a per-user one
+    (AppData\\Local\\Programs) - determines which install mode to tell the installer to repeat."""
+    candidates = [os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramW6432")]
+    install_dir_str = str(install_dir).lower()
+    return any(candidate and install_dir_str.startswith(candidate.lower()) for candidate in candidates)
 
 
 def _download_file(url: str, destination: Path) -> None:
@@ -146,30 +147,3 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _relaunch_script(pid: int, source_dir: Path, install_dir: Path, staging_dir: Path) -> str:
-    exe_name = Path(sys.executable).name
-    # PowerShell here-string values: paths are user/CI-controlled install locations, not
-    # arbitrary input, but they're still quoted rather than interpolated unquoted.
-    return f"""
-$ErrorActionPreference = "Stop"
-$targetPid = {pid}
-$source = "{source_dir}"
-$dest = "{install_dir}"
-$exe = Join-Path "{install_dir}" "{exe_name}"
-
-for ($i = 0; $i -lt 60; $i++) {{
-    if (-not (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)) {{ break }}
-    Start-Sleep -Seconds 1
-}}
-
-robocopy $source $dest /MIR /R:3 /W:2 | Out-Null
-if ($LASTEXITCODE -ge 8) {{
-    exit 1
-}}
-
-Start-Process -FilePath $exe
-Start-Sleep -Seconds 2
-Remove-Item -Path "{staging_dir}" -Recurse -Force -ErrorAction SilentlyContinue
-"""

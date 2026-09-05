@@ -1,12 +1,11 @@
 """
 Coverage for the self-updater: version comparison, the GitHub API check (mocked - no real
-network calls), and the parts of apply_update() that are safely testable without actually
-replacing files on disk (download/checksum verification, extraction, script generation), with
-the actual process handoff (subprocess.Popen + on_exit) mocked out.
+network calls), and the parts of apply_update() that are safely testable without actually running
+an installer (download/checksum verification, install-mode detection), with the actual process
+handoff (subprocess.Popen + on_exit) mocked out.
 """
 import hashlib
 import sys
-import zipfile
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -51,8 +50,8 @@ def test_check_for_update_finds_a_newer_version(monkeypatch):
     response = _mock_release_response(
         "v0.2.0",
         [
-            {"name": "FireshareAgent-v0.2.0-win64.zip", "browser_download_url": "https://example.com/app.zip"},
-            {"name": "FireshareAgent-v0.2.0-win64.zip.sha256", "browser_download_url": "https://example.com/app.zip.sha256"},
+            {"name": "FireshareAgent-Setup-0.2.0.exe", "browser_download_url": "https://example.com/setup.exe"},
+            {"name": "FireshareAgent-Setup-0.2.0.exe.sha256", "browser_download_url": "https://example.com/setup.exe.sha256"},
         ],
     )
 
@@ -61,15 +60,15 @@ def test_check_for_update_finds_a_newer_version(monkeypatch):
 
     assert result is not None
     assert result.version == "0.2.0"
-    assert result.download_url == "https://example.com/app.zip"
-    assert result.checksum_url == "https://example.com/app.zip.sha256"
+    assert result.download_url == "https://example.com/setup.exe"
+    assert result.checksum_url == "https://example.com/setup.exe.sha256"
 
 
 def test_check_for_update_returns_none_when_already_current(monkeypatch):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(updater, "__version__", "0.2.0")
 
-    response = _mock_release_response("v0.2.0", [{"name": "x.zip", "browser_download_url": "u"}])
+    response = _mock_release_response("v0.2.0", [{"name": "x.exe", "browser_download_url": "u"}])
 
     with patch("fireshare_agent.updater.requests.get", return_value=response):
         result = updater.check_for_update()
@@ -77,7 +76,7 @@ def test_check_for_update_returns_none_when_already_current(monkeypatch):
     assert result is None
 
 
-def test_check_for_update_returns_none_without_a_zip_asset(monkeypatch):
+def test_check_for_update_returns_none_without_an_installer_asset(monkeypatch):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(updater, "__version__", "0.1.0")
 
@@ -111,84 +110,92 @@ def _mock_streaming_response() -> MagicMock:
     return resp
 
 
-def _make_fake_release_zip(tmp_path) -> tuple[bytes, str]:
-    zip_path = tmp_path / "source.zip"
-    with zipfile.ZipFile(zip_path, "w") as zf:
-        zf.writestr("FireshareAgent.exe", b"fake exe bytes")
-        zf.writestr("_internal/data.bin", b"fake data")
-    content = zip_path.read_bytes()
+def _fake_installer_bytes() -> tuple[bytes, str]:
+    content = b"fake installer exe bytes"
     return content, hashlib.sha256(content).hexdigest()
 
 
-def test_apply_update_verifies_checksum_and_hands_off_to_relaunch_script(tmp_path, monkeypatch):
-    zip_bytes, correct_checksum = _make_fake_release_zip(tmp_path)
-
-    monkeypatch.setattr(sys, "executable", str(tmp_path / "install" / "FireshareAgent.exe"), raising=False)
-    monkeypatch.setattr(updater, "app_data_dir", lambda: tmp_path / "appdata")
-
+def _fake_get(installer_bytes: bytes, checksum: str):
     def fake_get(url, timeout=None, stream=False, headers=None):
-        if url == "https://example.com/app.zip":
+        if url == "https://example.com/setup.exe":
             resp = _mock_streaming_response()
-            resp.iter_content = lambda chunk_size: [zip_bytes]
+            resp.iter_content = lambda chunk_size: [installer_bytes]
             return resp
         resp = MagicMock()
         resp.raise_for_status.return_value = None
-        resp.text = f"{correct_checksum}  FireshareAgent-v0.2.0-win64.zip\n"
+        resp.text = f"{checksum}  FireshareAgent-Setup-0.2.0.exe\n"
         return resp
 
-    info = UpdateInfo(
+    return fake_get
+
+
+def _update_info() -> UpdateInfo:
+    return UpdateInfo(
         version="0.2.0", tag="v0.2.0",
-        download_url="https://example.com/app.zip",
-        checksum_url="https://example.com/app.zip.sha256",
+        download_url="https://example.com/setup.exe",
+        checksum_url="https://example.com/setup.exe.sha256",
         notes_url="https://example.com/releases/latest",
     )
 
+
+def test_apply_update_verifies_checksum_and_launches_installer_silently(tmp_path, monkeypatch):
+    installer_bytes, correct_checksum = _fake_installer_bytes()
+
+    install_dir = tmp_path / "AppData" / "Local" / "Programs" / "FireshareAgent"
+    monkeypatch.setattr(sys, "executable", str(install_dir / "FireshareAgent.exe"), raising=False)
+    monkeypatch.setattr(updater, "app_data_dir", lambda: tmp_path / "appdata")
+    monkeypatch.delenv("ProgramFiles", raising=False)
+    monkeypatch.delenv("ProgramFiles(x86)", raising=False)
+    monkeypatch.delenv("ProgramW6432", raising=False)
+
     exited = []
-    with patch("fireshare_agent.updater.requests.get", side_effect=fake_get):
+    with patch("fireshare_agent.updater.requests.get", side_effect=_fake_get(installer_bytes, correct_checksum)):
         with patch("fireshare_agent.updater.subprocess.Popen") as mock_popen:
-            updater.apply_update(info, on_exit=lambda: exited.append(True))
+            updater.apply_update(_update_info(), on_exit=lambda: exited.append(True))
 
     assert exited == [True]  # handed off and told the app to quit
     mock_popen.assert_called_once()
     launched_args = mock_popen.call_args.args[0]
-    assert "powershell.exe" in launched_args[0].lower()
+    assert launched_args[0].endswith("FireshareAgentSetup.exe")
+    assert "/VERYSILENT" in launched_args
+    assert "/CURRENTUSER" in launched_args  # not a Program Files install
+    assert "/ALLUSERS" not in launched_args
 
-    script_path = tmp_path / "appdata" / "update" / "0.2.0" / "apply_update.ps1"
-    assert script_path.exists()
-    script_text = script_path.read_text()
-    assert "robocopy" in script_text.lower()
-    assert "FireshareAgent.exe" in script_text
+    installer_path = tmp_path / "appdata" / "update" / "0.2.0" / "FireshareAgentSetup.exe"
+    assert installer_path.exists()
+    assert installer_path.read_bytes() == installer_bytes
 
-    extracted_dir = tmp_path / "appdata" / "update" / "0.2.0" / "extracted"
-    assert (extracted_dir / "FireshareAgent.exe").exists()
+
+def test_apply_update_uses_allusers_flag_for_a_program_files_install(tmp_path, monkeypatch):
+    installer_bytes, correct_checksum = _fake_installer_bytes()
+
+    program_files = tmp_path / "Program Files"
+    install_dir = program_files / "Fireshare Agent"
+    monkeypatch.setattr(sys, "executable", str(install_dir / "FireshareAgent.exe"), raising=False)
+    monkeypatch.setattr(updater, "app_data_dir", lambda: tmp_path / "appdata")
+    monkeypatch.setenv("ProgramFiles", str(program_files))
+    monkeypatch.delenv("ProgramFiles(x86)", raising=False)
+    monkeypatch.delenv("ProgramW6432", raising=False)
+
+    with patch("fireshare_agent.updater.requests.get", side_effect=_fake_get(installer_bytes, correct_checksum)):
+        with patch("fireshare_agent.updater.subprocess.Popen") as mock_popen:
+            updater.apply_update(_update_info(), on_exit=lambda: None)
+
+    launched_args = mock_popen.call_args.args[0]
+    assert "/ALLUSERS" in launched_args
+    assert "/CURRENTUSER" not in launched_args
 
 
 def test_apply_update_rejects_a_checksum_mismatch(tmp_path, monkeypatch):
-    zip_bytes, _real_checksum = _make_fake_release_zip(tmp_path)
+    installer_bytes, _real_checksum = _fake_installer_bytes()
 
     monkeypatch.setattr(sys, "executable", str(tmp_path / "install" / "FireshareAgent.exe"), raising=False)
     monkeypatch.setattr(updater, "app_data_dir", lambda: tmp_path / "appdata")
 
-    def fake_get(url, timeout=None, stream=False, headers=None):
-        if url.endswith(".zip"):
-            resp = _mock_streaming_response()
-            resp.iter_content = lambda chunk_size: [zip_bytes]
-            return resp
-        resp = MagicMock()
-        resp.raise_for_status.return_value = None
-        resp.text = "0000000000000000000000000000000000000000000000000000000000000000  bad.zip\n"
-        return resp
-
-    info = UpdateInfo(
-        version="0.2.0", tag="v0.2.0",
-        download_url="https://example.com/app.zip",
-        checksum_url="https://example.com/app.zip.sha256",
-        notes_url="https://example.com/releases/latest",
-    )
-
-    with patch("fireshare_agent.updater.requests.get", side_effect=fake_get):
+    bad_checksum = "0" * 64
+    with patch("fireshare_agent.updater.requests.get", side_effect=_fake_get(installer_bytes, bad_checksum)):
         with patch("fireshare_agent.updater.subprocess.Popen") as mock_popen:
             with pytest.raises(RuntimeError, match="checksum"):
-                updater.apply_update(info, on_exit=lambda: None)
+                updater.apply_update(_update_info(), on_exit=lambda: None)
 
-    mock_popen.assert_not_called()  # never handed off to the relaunch script on a bad checksum
+    mock_popen.assert_not_called()  # never launched the installer on a bad checksum
