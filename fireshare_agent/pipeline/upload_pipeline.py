@@ -43,6 +43,12 @@ class UploadPipeline:
         self._queue: "queue.Queue[str | None]" = queue.Queue()
         self._in_flight: dict[str, float] = {}  # path -> first-seen monotonic timestamp
         self._in_flight_lock = threading.Lock()
+        # path -> (pending_file, fingerprint, attempts already made) for a candidate that has
+        # passed its duplicate/exists-at-destination checks and is partway through its upload
+        # retry budget. Presence of an entry means a retry should skip straight to re-attempting
+        # the upload rather than redoing those checks.
+        self._retry_state: dict[str, tuple[PendingFile, str, int]] = {}
+        self._retry_state_lock = threading.Lock()
         self._pending_retry_timers: list[threading.Timer] = []
         self._pending_retry_timers_lock = threading.Lock()
 
@@ -81,6 +87,8 @@ class UploadPipeline:
             for timer in self._pending_retry_timers:
                 timer.cancel()
             self._pending_retry_timers.clear()
+        with self._retry_state_lock:
+            self._retry_state.clear()
         self._queue.put(None)  # unblock a pending queue.get()
         if self._worker_thread is not None:
             self._worker_thread.join(timeout=5)
@@ -157,75 +165,103 @@ class UploadPipeline:
     def _process_candidate(self, path: str) -> bool:
         """Returns True once this path is fully resolved (succeeded/failed/duplicate) and can
         leave the in-flight set. Returns False if it was requeued for a later readiness check
-        (still being written) - it stays marked in-flight so a watcher event or Sync Now doesn't
-        pile another copy of it onto the queue in the meantime."""
+        (still being written) or a later upload retry - it stays marked in-flight so a watcher
+        event or Sync Now doesn't pile another copy of it onto the queue in the meantime."""
         kind = self._resolve_kind(path)
         if kind is None:
+            self._clear_retry_state(path)
             return True
 
         if not os.path.exists(path):
+            self._clear_retry_state(path)
             return True  # moved or deleted before we got to it
 
-        if not is_ready(path):
-            with self._in_flight_lock:
-                first_seen = self._in_flight.get(path, time.monotonic())
-            if time.monotonic() - first_seen > _MAX_WAIT_FOR_READY_SECONDS:
-                self._raise_activity(path, kind, PipelineEventKind.FAILED, "File never finished being written after 24 hours - giving up")
+        with self._retry_state_lock:
+            retrying = self._retry_state.get(path)
+
+        if retrying is None:
+            if not is_ready(path):
+                with self._in_flight_lock:
+                    first_seen = self._in_flight.get(path, time.monotonic())
+                if time.monotonic() - first_seen > _MAX_WAIT_FOR_READY_SECONDS:
+                    self._raise_activity(path, kind, PipelineEventKind.FAILED, "File never finished being written after 24 hours - giving up")
+                    return True
+
+                # A single ShadowPlay "Record" session (as opposed to a quick Instant Replay clip)
+                # can stay open and growing for hours, so this requeues indefinitely rather than
+                # giving up after a fixed number of attempts - and does it via a timer rather than
+                # blocking this worker thread, so other ready files aren't stuck queued behind it.
+                self._raise_activity(path, kind, PipelineEventKind.WAITING, "Still being written; will check again shortly")
+                self._schedule_requeue(path, _NOT_READY_RETRY_DELAY_SECONDS)
+                return False
+
+            size_bytes = os.path.getsize(path)
+            fp = fingerprint.compute(path, size_bytes)
+
+            if self._manifest.is_already_handled(fp):
+                self._raise_activity(path, kind, PipelineEventKind.SKIPPED_DUPLICATE)
                 return True
 
-            # A single ShadowPlay "Record" session (as opposed to a quick Instant Replay clip)
-            # can stay open and growing for hours, so this requeues indefinitely rather than
-            # giving up after a fixed number of attempts - and does it via a timer rather than
-            # blocking this worker thread, so other ready files aren't stuck queued behind it.
-            self._raise_activity(path, kind, PipelineEventKind.WAITING, "Still being written; will check again shortly")
-            if not self._stop_event.is_set():
-                timer = threading.Timer(_NOT_READY_RETRY_DELAY_SECONDS, self._requeue, args=(path,))
-                timer.daemon = True
-                with self._pending_retry_timers_lock:
-                    self._pending_retry_timers.append(timer)
-                timer.start()
-            return False
+            uploader = self._get_or_create_uploader()
+            pending_file = PendingFile(
+                path=path, kind=kind, size_bytes=size_bytes,
+                remote_folder_hint=self._compute_remote_folder_hint(path),
+            )
 
-        size_bytes = os.path.getsize(path)
-        fp = fingerprint.compute(path, size_bytes)
-
-        if self._manifest.is_already_handled(fp):
-            self._raise_activity(path, kind, PipelineEventKind.SKIPPED_DUPLICATE)
-            return True
-
-        uploader = self._get_or_create_uploader()
-        pending_file = PendingFile(
-            path=path, kind=kind, size_bytes=size_bytes,
-            remote_folder_hint=self._compute_remote_folder_hint(path),
-        )
-
-        # Best-effort check against the actual destination (not just our local history) - covers
-        # a lost/fresh-install manifest, or a file that was already uploaded some other way.
-        if uploader.exists_at_destination(pending_file):
-            self._manifest.record_already_existed(fp, path, size_bytes, _UPLOAD_METHOD_LABEL)
-            self._apply_post_upload_action(path)
-            self._raise_activity(path, kind, PipelineEventKind.ALREADY_AT_DESTINATION)
-            return True
-
-        self._raise_activity(path, kind, PipelineEventKind.UPLOADING)
-
-        last_error = "Unknown error"
-        for attempt in range(1, self._config.max_retry_attempts + 1):
-            result = uploader.upload(pending_file)
-            if result.success:
-                self._manifest.record_success(fp, path, size_bytes, _UPLOAD_METHOD_LABEL)
+            # Best-effort check against the actual destination (not just our local history) -
+            # covers a lost/fresh-install manifest, or a file that was already uploaded some
+            # other way.
+            if uploader.exists_at_destination(pending_file):
+                self._manifest.record_already_existed(fp, path, size_bytes, _UPLOAD_METHOD_LABEL)
                 self._apply_post_upload_action(path)
-                self._raise_activity(path, kind, PipelineEventKind.SUCCEEDED)
+                self._raise_activity(path, kind, PipelineEventKind.ALREADY_AT_DESTINATION)
                 return True
 
-            last_error = result.error_message or "Unknown error"
-            if attempt < self._config.max_retry_attempts:
-                backoff = min(self._config.retry_backoff_seconds * (2 ** (attempt - 1)), _MAX_RETRY_BACKOFF_SECONDS)
-                time.sleep(backoff)
+            self._raise_activity(path, kind, PipelineEventKind.UPLOADING)
+            attempts_made = 0
+        else:
+            pending_file, fp, attempts_made = retrying
+            uploader = self._get_or_create_uploader()
 
-        self._manifest.record_failure(fp, path, size_bytes, _UPLOAD_METHOD_LABEL, last_error)
-        self._raise_activity(path, kind, PipelineEventKind.FAILED, last_error)
-        return True
+        result = uploader.upload(pending_file)
+        if result.success:
+            self._manifest.record_success(fp, path, pending_file.size_bytes, _UPLOAD_METHOD_LABEL)
+            self._apply_post_upload_action(path)
+            self._raise_activity(path, kind, PipelineEventKind.SUCCEEDED)
+            self._clear_retry_state(path)
+            return True
+
+        attempts_made += 1
+        error = result.error_message or "Unknown error"
+        if attempts_made >= self._config.max_retry_attempts:
+            self._manifest.record_failure(fp, path, pending_file.size_bytes, _UPLOAD_METHOD_LABEL, error)
+            self._raise_activity(path, kind, PipelineEventKind.FAILED, error)
+            self._clear_retry_state(path)
+            return True
+
+        # Requeue via a timer instead of blocking this worker thread on time.sleep() for the
+        # backoff - otherwise one failing upload (e.g. the server briefly unreachable) would
+        # stall every other already-queued file for the full retry budget, which can be tens of
+        # minutes with the default settings and far longer with a raised retry count/backoff.
+        with self._retry_state_lock:
+            self._retry_state[path] = (pending_file, fp, attempts_made)
+        backoff = min(self._config.retry_backoff_seconds * (2 ** (attempts_made - 1)), _MAX_RETRY_BACKOFF_SECONDS)
+        self._raise_activity(path, kind, PipelineEventKind.WAITING, f"Upload attempt {attempts_made} failed ({error}); retrying in {int(backoff)}s")
+        self._schedule_requeue(path, backoff)
+        return False
+
+    def _clear_retry_state(self, path: str) -> None:
+        with self._retry_state_lock:
+            self._retry_state.pop(path, None)
+
+    def _schedule_requeue(self, path: str, delay_seconds: float) -> None:
+        if self._stop_event.is_set():
+            return
+        timer = threading.Timer(delay_seconds, self._requeue, args=(path,))
+        timer.daemon = True
+        with self._pending_retry_timers_lock:
+            self._pending_retry_timers.append(timer)
+        timer.start()
 
     def _requeue(self, path: str) -> None:
         if not self._stop_event.is_set():
