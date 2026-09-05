@@ -65,10 +65,13 @@ class TrayIcon:
         self._pending_review_count = pending_review_count
         self._on_exit = on_exit
 
+        # Built from the live callbacks rather than hardcoded to the unpaused artwork: the pause
+        # state is restored from the manifest before the tray is constructed, so an agent that
+        # was paused when it last exited must come back up already showing as paused.
         self.icon = pystray.Icon(
             "FireshareAgent",
-            icon=_build_icon_image(False, False),
-            title="Fireshare Agent",
+            icon=_build_icon_image(self._is_paused(), self._has_failures()),
+            title=self._title(),
             menu=pystray.Menu(
                 pystray.MenuItem(
                     lambda item: f"Update to {self._update_version()} Now",
@@ -92,9 +95,12 @@ class TrayIcon:
             ),
         )
 
+    def _title(self) -> str:
+        return "Fireshare Agent (paused)" if self._is_paused() else "Fireshare Agent"
+
     def refresh(self) -> None:
         self.icon.icon = _build_icon_image(self._is_paused(), self._has_failures())
-        self.icon.title = "Fireshare Agent (paused)" if self._is_paused() else "Fireshare Agent"
+        self.icon.title = self._title()
         self.icon.update_menu()
 
     def run(self) -> None:

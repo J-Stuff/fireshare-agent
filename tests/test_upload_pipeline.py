@@ -8,6 +8,7 @@ looping in place, with a generous 24h cap for a genuinely stuck file rather than
 count.
 """
 import os
+import sqlite3
 import time
 
 import pytest
@@ -401,3 +402,67 @@ def test_remote_folder_hint_normalizes_nested_paths_to_forward_slashes(tmp_path)
     hint = pipeline._compute_remote_folder_hint(str(clip))
     assert hint == "Game/Highlights"
     assert os.sep not in hint or os.sep == "/"
+
+
+def test_saving_settings_does_not_resume_a_paused_pipeline(tmp_path):
+    """The user-visible shape of the folder_watcher pause-reset bug: pause from the tray, open
+    Settings, save anything at all, and watching used to silently resume while the tray icon and
+    menu label both went on insisting the agent was paused."""
+    watched = tmp_path / "clips"
+    watched.mkdir()
+    config = AppConfig(watch_folders=[WatchFolderConfig(path=str(watched))])
+    pipeline = _pipeline(tmp_path, config)
+
+    pipeline.pause()
+    assert pipeline.is_paused is True
+
+    pipeline.update_config(AppConfig(watch_folders=[WatchFolderConfig(path=str(watched))]))
+
+    try:
+        assert pipeline.is_paused is True
+    finally:
+        pipeline.stop()
+
+
+def test_pausing_persists_across_a_restart(tmp_path):
+    """A pause the user set from the tray has to outlive the app: previously it lived only in the
+    FolderWatcherService instance, so any restart came back up watching."""
+    manifest_path = str(tmp_path / "manifest.db")
+    config = AppConfig()
+
+    first_run = UploadPipeline(ManifestStore(manifest_path), config)
+    first_run.pause()
+
+    restarted = UploadPipeline(ManifestStore(manifest_path), config)
+    assert restarted.is_paused is True
+
+
+def test_resuming_persists_across_a_restart(tmp_path):
+    manifest_path = str(tmp_path / "manifest.db")
+    config = AppConfig()
+
+    first_run = UploadPipeline(ManifestStore(manifest_path), config)
+    first_run.pause()
+    first_run.resume()
+
+    assert UploadPipeline(ManifestStore(manifest_path), config).is_paused is False
+
+
+def test_a_pipeline_with_no_stored_state_starts_unpaused(tmp_path):
+    assert _pipeline(tmp_path).is_paused is False
+
+
+def test_pause_still_applies_when_it_cannot_be_persisted(tmp_path, monkeypatch):
+    """The toggle runs on the tray's callback thread. A database problem must not propagate out of
+    it, and must not leave the agent watching while the tray reports it as paused - losing the
+    state at the next restart is the acceptable failure, lying about it now is not."""
+    manifest = ManifestStore(str(tmp_path / "manifest.db"))
+
+    def _boom(paused: bool) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(manifest, "set_watching_paused", _boom)
+    pipeline = UploadPipeline(manifest, AppConfig())
+    pipeline.pause()
+
+    assert pipeline.is_paused is True

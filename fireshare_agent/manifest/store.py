@@ -2,6 +2,11 @@
 Local SQLite-backed record of what has already been uploaded (or permanently failed), so
 restarts and manual rescans never re-upload the same file.
 
+Also carries a small `agent_state` key/value table for runtime state that has to outlive a
+restart but is not a user-authored setting - currently just the pause flag. That deliberately
+does not live in config.json: saving Settings rewrites the whole AppConfig from memory, so a
+value the tray can change behind the settings window's back would be clobbered on the next save.
+
 Opens a fresh connection per call rather than sharing one across threads - the watcher, upload
 worker, and UI can all touch this from different threads and SQLite connections aren't safe to
 share across threads without extra locking. Call volume here is low (one write per upload
@@ -34,7 +39,16 @@ CREATE TABLE IF NOT EXISTS uploads (
 );
 CREATE INDEX IF NOT EXISTS idx_uploads_status ON uploads(status);
 CREATE INDEX IF NOT EXISTS idx_uploads_updated_at ON uploads(updated_at_utc DESC);
+
+CREATE TABLE IF NOT EXISTS agent_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
+
+# Values are stored as text rather than integers so this table can hold non-boolean state later
+# without a schema change.
+_STATE_WATCHING_PAUSED = "watching_paused"
 
 
 @dataclass(frozen=True)
@@ -156,6 +170,29 @@ class ManifestStore:
         record that stops this file being uploaded again."""
         with self._connection() as conn:
             conn.execute("UPDATE uploads SET pending_review = 0 WHERE fingerprint = ?", (fingerprint,))
+
+    def is_watching_paused(self) -> bool:
+        """Whether the user left the agent paused. Read once at startup to restore the pause
+        across restarts; defaults to False for a database written before this table existed."""
+        return self._get_flag(_STATE_WATCHING_PAUSED, default=False)
+
+    def set_watching_paused(self, paused: bool) -> None:
+        self._set_flag(_STATE_WATCHING_PAUSED, paused)
+
+    def _get_flag(self, key: str, default: bool) -> bool:
+        with self._connection() as conn:
+            row = conn.execute("SELECT value FROM agent_state WHERE key = ?", (key,)).fetchone()
+        return default if row is None else row[0] == "1"
+
+    def _set_flag(self, key: str, value: bool) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO agent_state (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, "1" if value else "0"),
+            )
 
     def get_recent(self, limit: int = 100) -> list[ManifestEntry]:
         return self._select("ORDER BY updated_at_utc DESC LIMIT ?", (limit,))

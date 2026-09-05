@@ -5,6 +5,7 @@ upload bandwidth or the OS with parallel large-file transfers.
 """
 from __future__ import annotations
 
+import logging
 import os
 import queue
 import threading
@@ -22,6 +23,8 @@ from fireshare_agent.uploaders.base import Uploader
 from fireshare_agent.uploaders.web_api_uploader import WebApiUploader
 from fireshare_agent.watching.folder_watcher import FolderWatcherService
 from fireshare_agent.watching.readiness import is_ready
+
+log = logging.getLogger(__name__)
 
 _NOT_READY_RETRY_DELAY_SECONDS = 15.0
 _MAX_WAIT_FOR_READY_SECONDS = 24 * 60 * 60  # a file that never stabilizes after 24h is abandoned
@@ -65,6 +68,10 @@ class UploadPipeline:
         self._mfa_code_provider = mfa_code_provider
 
         self._watcher = FolderWatcherService()
+        # Pause is sticky across restarts: an agent the user paused stays paused until they
+        # resume it, rather than quietly coming back up watching after the next reboot.
+        if manifest.is_watching_paused():
+            self._watcher.pause()
         self._queue: "queue.Queue[str | None]" = queue.Queue()
         self._in_flight: dict[str, float] = {}  # path -> first-seen monotonic timestamp
         self._in_flight_lock = threading.Lock()
@@ -161,9 +168,21 @@ class UploadPipeline:
 
     def pause(self) -> None:
         self._watcher.pause()
+        self._persist_paused(True)
 
     def resume(self) -> None:
         self._watcher.resume()
+        self._persist_paused(False)
+
+    def _persist_paused(self, paused: bool) -> None:
+        """Runtime state is updated first and persisted second, so a database problem leaves the
+        agent actually doing what the tray says it is doing - the only thing lost is the memory
+        of it across the next restart. Called on the tray's callback thread, so it must not
+        raise: an unhandled error here would take out the pause toggle itself."""
+        try:
+            self._manifest.set_watching_paused(paused)
+        except Exception:
+            log.exception("Could not persist the pause state; it will not survive a restart.")
 
     def update_config(self, config: AppConfig) -> None:
         """Applies newly saved settings: restarts folder watches and forces the uploader to be rebuilt."""

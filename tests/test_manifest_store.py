@@ -108,3 +108,49 @@ def test_migration_is_idempotent(tmp_path):
 
     store.record_already_existed("fp1", r"C:\clip.mp4", 1, "web_api", pending_review=True)
     assert store.get_pending_review_count() == 1
+
+
+def test_pause_state_defaults_to_not_paused(tmp_path):
+    store = ManifestStore(str(tmp_path / "manifest.db"))
+    assert store.is_watching_paused() is False
+
+
+def test_pause_state_round_trips_through_a_reopen(tmp_path):
+    db_path = str(tmp_path / "manifest.db")
+    ManifestStore(db_path).set_watching_paused(True)
+
+    assert ManifestStore(db_path).is_watching_paused() is True
+
+
+def test_pause_state_can_be_cleared(tmp_path):
+    db_path = str(tmp_path / "manifest.db")
+    store = ManifestStore(db_path)
+    store.set_watching_paused(True)
+    store.set_watching_paused(False)
+
+    assert ManifestStore(db_path).is_watching_paused() is False
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute("SELECT COUNT(*) FROM agent_state").fetchone()
+    assert rows[0] == 1  # upserted in place rather than accumulating a row per toggle
+
+
+def test_agent_state_table_is_created_in_a_database_that_predates_it(tmp_path):
+    # agent_state arrived after the review column, so an existing user's database has neither.
+    # A new *table* needs no _migrate() entry - unlike ALTER TABLE, CREATE TABLE IF NOT EXISTS
+    # really does apply to an already-populated database - and this pins that.
+    db_path = tmp_path / "manifest.db"
+    conn = sqlite3.connect(str(db_path))
+    with conn:
+        conn.executescript(_PRE_REVIEW_SCHEMA)
+        conn.execute(
+            "INSERT INTO uploads VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("fp1", r"C:\old_clip.mp4", 99, "2026-01-01T00:00:00+00:00", "web_api", "success", None),
+        )
+    conn.close()
+
+    store = ManifestStore(str(db_path))
+
+    assert store.is_watching_paused() is False
+    store.set_watching_paused(True)
+    assert store.is_watching_paused() is True
+    assert store.is_already_handled("fp1") is True  # upgrade did not disturb existing history

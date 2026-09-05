@@ -48,7 +48,15 @@ class FireshareAgentApp:
 
     def run(self) -> None:
         self.pipeline.start()
-        self.pipeline.sync_now()  # catches anything created while the app wasn't running
+        if self.pipeline.is_paused:
+            # Pause now survives a restart, which makes this rescan newly dangerous: a paused
+            # agent would come back up and immediately upload everything it found sitting in the
+            # watch folders - exactly what the user paused it to stop. Pause suppresses automatic
+            # work; the manual "Sync Now" menu item is deliberately still allowed to run, since
+            # that is a button the user just pressed rather than something happening on its own.
+            log.info("Agent is paused; skipping the startup rescan.")
+        else:
+            self.pipeline.sync_now()  # catches anything created while the app wasn't running
 
         self.tray = TrayIcon(
             on_open_settings=lambda: self.run_on_ui_thread(self.open_settings),
@@ -96,6 +104,11 @@ class FireshareAgentApp:
         self.config = new_config
         config_store.save(new_config)
         self.pipeline.update_config(new_config)
+        # The icon and menu labels are rendered from live callbacks (pause state, failure count,
+        # pending-review count), and nothing else on this path pokes them. Refresh unconditionally
+        # so the tray can never keep asserting a state the pipeline has moved on from.
+        if self.tray:
+            self.tray.refresh()
         log.info("Settings saved; watcher and uploader reconfigured.")
 
     def _toggle_pause(self) -> None:
