@@ -29,6 +29,13 @@ _MAX_RETRY_BACKOFF_SECONDS = 30 * 60
 _UPLOAD_METHOD_LABEL = "web_api"  # recorded in the manifest DB for historical/debugging purposes
 
 
+_REVIEW_ACTION_VERB = {
+    PostUploadAction.LEAVE: "keep",
+    PostUploadAction.MOVE_TO_SUBFOLDER: "move",
+    PostUploadAction.DELETE: "delete",
+}
+
+
 @dataclass(frozen=True)
 class ReviewOutcome:
     """What actually happened when the user's decision about a reviewed file was carried out.
@@ -101,8 +108,33 @@ class UploadPipeline:
         server-side file by name alone. Called from the UI thread, not the upload worker - it
         touches only this one file and the manifest row for it, both of which the worker has
         already finished with by the time a row becomes reviewable."""
-        # TODO(human): decide what happens for each outcome and return the matching ReviewOutcome.
-        ...
+        name = os.path.basename(entry.path)
+
+        # The row can outlive the file: minutes or days may pass between the match being recorded
+        # and the user getting to it, and in the meantime they may have moved or deleted the file
+        # in Explorer themselves. There is nothing left to act on, and leaving the entry queued
+        # would strand it there permanently, so treat it as answered rather than as a failure.
+        if not os.path.exists(entry.path):
+            self._manifest.clear_pending_review(entry.fingerprint)
+            return ReviewOutcome.done(f"{name} is no longer on disk - removed from the review list.")
+
+        try:
+            self.perform_local_action(entry.path, action)
+        except OSError as ex:
+            # Deliberately leaves the row pending. A locked file is precisely the case the user
+            # can fix (close whatever holds it) and try again, and clearing the flag here would
+            # leave them believing the file had been dealt with when it hadn't.
+            return ReviewOutcome.failed(f"Could not {_REVIEW_ACTION_VERB[action]} {name}: {ex}")
+
+        self._manifest.clear_pending_review(entry.fingerprint)
+        return ReviewOutcome.done(self._review_success_message(name, action))
+
+    def _review_success_message(self, name: str, action: PostUploadAction) -> str:
+        if action == PostUploadAction.MOVE_TO_SUBFOLDER:
+            return f"{name} moved to {self._config.move_to_subfolder_name}."
+        if action == PostUploadAction.DELETE:
+            return f"{name} deleted."
+        return f"{name} kept in place."
 
     def start(self) -> None:
         self._stop_event.clear()

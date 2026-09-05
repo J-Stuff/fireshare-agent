@@ -8,6 +8,8 @@ parks the file here instead - the user decides, per file, what happens to it.
 """
 from __future__ import annotations
 
+import tkinter.messagebox as messagebox
+
 import customtkinter as ctk
 
 from fireshare_agent import assets
@@ -123,6 +125,20 @@ class ActivityWindow(ctk.CTkToplevel):
     def _resolve(self, entry: ManifestEntry, action: PostUploadAction) -> None:
         if self._pipeline is None:
             return
+
+        # This whole queue exists because the agent refuses to delete a file on an unverified
+        # match. Letting a single misclick do it here would hand back exactly the risk the queue
+        # was built to remove - and unlike the agent, the user can confirm they know which file
+        # this is.
+        if action == PostUploadAction.DELETE and not messagebox.askyesno(
+            "Delete Local File",
+            f"Permanently delete this local file?\n\n{entry.path}\n\n"
+            "Fireshare was matched by filename only, so this copy may not actually be on the "
+            "server. This cannot be undone.",
+            parent=self,
+        ):
+            return
+
         outcome = self._pipeline.resolve_pending_review(entry, action)
         widgets.set_status(self._review_status, "success" if outcome.resolved else "error", outcome.message)
         self._review_status.pack(fill="x", padx=16, pady=(6, 0), before=self._textbox)

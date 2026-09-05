@@ -10,9 +10,11 @@ count.
 import os
 import time
 
+import pytest
+
 from fireshare_agent.config.app_config import AppConfig, WatchFolderConfig
 from fireshare_agent.manifest.store import ManifestStore
-from fireshare_agent.models import UploadResult
+from fireshare_agent.models import PostUploadAction, UploadResult
 from fireshare_agent.pipeline import upload_pipeline
 from fireshare_agent.pipeline.activity import PipelineEventKind
 from fireshare_agent.pipeline.upload_pipeline import UploadPipeline
@@ -263,6 +265,126 @@ def test_sync_now_skips_the_post_upload_subfolder(tmp_path, monkeypatch):
     pipeline.sync_now()
 
     assert enqueued == [str(game_dir / "new_clip.mp4")]
+
+
+class _AlreadyThereUploader:
+    """An uploader that claims every file is already on the server, to drive the
+    exists_at_destination path."""
+
+    def exists_at_destination(self, file) -> bool:
+        return True
+
+    def upload(self, file) -> UploadResult:  # pragma: no cover - must never be reached
+        raise AssertionError("upload() must not be called for a file already at the destination")
+
+
+def _queue_one_for_review(tmp_path, monkeypatch, post_upload_action: str):
+    """Runs a clip through the pipeline with an uploader that reports it already exists, and
+    returns (pipeline, clip_path, review_entry)."""
+    monkeypatch.setattr(upload_pipeline, "is_ready", lambda path: True)
+
+    config = AppConfig(post_upload_action=post_upload_action, move_to_subfolder_name="Uploaded")
+    pipeline = _pipeline(tmp_path, config)
+    monkeypatch.setattr(pipeline, "_get_or_create_uploader", lambda: _AlreadyThereUploader())
+
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+
+    assert pipeline._process_candidate(str(clip)) is True
+    pending = pipeline.get_pending_review()
+    assert len(pending) == 1
+    return pipeline, clip, pending[0]
+
+
+@pytest.mark.parametrize("action", [PostUploadAction.DELETE.value, PostUploadAction.MOVE_TO_SUBFOLDER.value])
+def test_inferred_server_match_never_touches_the_local_file(tmp_path, monkeypatch, action):
+    # The core data-loss regression: exists_at_destination() matches on filename alone, so acting
+    # on it automatically could move - or with the delete action configured, destroy - a local
+    # file that was never actually uploaded. It must only ever be queued for review.
+    pipeline, clip, entry = _queue_one_for_review(tmp_path, monkeypatch, action)
+
+    assert clip.exists()
+    assert entry.pending_review is True
+    assert pipeline.pending_review_count == 1
+    # Still deduped: it must not be re-uploaded while awaiting review.
+    assert pipeline._manifest.is_already_handled(entry.fingerprint) is True
+
+
+def test_review_keep_leaves_the_file_and_clears_the_queue(tmp_path, monkeypatch):
+    pipeline, clip, entry = _queue_one_for_review(tmp_path, monkeypatch, PostUploadAction.DELETE.value)
+
+    outcome = pipeline.resolve_pending_review(entry, PostUploadAction.LEAVE)
+
+    assert outcome.resolved is True
+    assert clip.exists()
+    assert pipeline.pending_review_count == 0
+
+
+def test_review_delete_removes_the_file(tmp_path, monkeypatch):
+    pipeline, clip, entry = _queue_one_for_review(tmp_path, monkeypatch, PostUploadAction.LEAVE.value)
+
+    outcome = pipeline.resolve_pending_review(entry, PostUploadAction.DELETE)
+
+    assert outcome.resolved is True
+    assert not clip.exists()
+    assert pipeline.pending_review_count == 0
+
+
+def test_review_move_relocates_the_file_to_the_configured_subfolder(tmp_path, monkeypatch):
+    pipeline, clip, entry = _queue_one_for_review(tmp_path, monkeypatch, PostUploadAction.LEAVE.value)
+
+    outcome = pipeline.resolve_pending_review(entry, PostUploadAction.MOVE_TO_SUBFOLDER)
+
+    assert outcome.resolved is True
+    assert not clip.exists()
+    assert (tmp_path / "Uploaded" / "clip.mp4").exists()
+    assert "Uploaded" in outcome.message
+    assert pipeline.pending_review_count == 0
+
+
+def test_review_of_an_already_deleted_file_resolves_instead_of_erroring(tmp_path, monkeypatch):
+    # The user may deal with the file in Explorer before getting to the review queue; the entry
+    # is then obsolete rather than failed, and must not be stranded in the list forever.
+    pipeline, clip, entry = _queue_one_for_review(tmp_path, monkeypatch, PostUploadAction.LEAVE.value)
+    clip.unlink()
+
+    outcome = pipeline.resolve_pending_review(entry, PostUploadAction.DELETE)
+
+    assert outcome.resolved is True
+    assert "no longer on disk" in outcome.message
+    assert pipeline.pending_review_count == 0
+
+
+def test_review_failure_leaves_the_entry_queued_for_another_try(tmp_path, monkeypatch):
+    # A locked file is exactly the case the user can fix and retry, so the entry must survive.
+    pipeline, clip, entry = _queue_one_for_review(tmp_path, monkeypatch, PostUploadAction.LEAVE.value)
+
+    def _boom(path, action):
+        raise OSError("file is in use by another process")
+
+    monkeypatch.setattr(pipeline, "perform_local_action", _boom)
+    outcome = pipeline.resolve_pending_review(entry, PostUploadAction.DELETE)
+
+    assert outcome.resolved is False
+    assert "in use" in outcome.message
+    assert pipeline.pending_review_count == 1  # still awaiting a decision
+
+
+def test_successful_upload_still_applies_the_post_upload_action(tmp_path, monkeypatch):
+    # Guard against over-correcting: only the *inferred* match is held back. A real, confirmed
+    # upload must still honour the configured action.
+    monkeypatch.setattr(upload_pipeline, "is_ready", lambda path: True)
+
+    config = AppConfig(post_upload_action=PostUploadAction.DELETE.value)
+    pipeline = _pipeline(tmp_path, config)
+    monkeypatch.setattr(pipeline, "_get_or_create_uploader", lambda: _FakeUploader([UploadResult.ok()]))
+
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+
+    assert pipeline._process_candidate(str(clip)) is True
+    assert not clip.exists()
+    assert pipeline.pending_review_count == 0
 
 
 def test_remote_folder_hint_normalizes_nested_paths_to_forward_slashes(tmp_path):
