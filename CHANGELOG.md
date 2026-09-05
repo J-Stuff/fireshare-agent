@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v1.1.0 (2026-09-05)
+
+### Bug Fixes
+
+- Trigger release for installer packaging ([#4](https://github.com/J-Stuff/fireshare-agent/pull/4),
+  [`be34060`](https://github.com/J-Stuff/fireshare-agent/commit/be3406039ba79ae38538defeb5b84ee3215dd27b))
+
+### Features
+
+- Update settings menu visuals ([#4](https://github.com/J-Stuff/fireshare-agent/pull/4),
+  [`be34060`](https://github.com/J-Stuff/fireshare-agent/commit/be3406039ba79ae38538defeb5b84ee3215dd27b))
+
+
 ## v1.0.1 (2026-09-05)
 
 ### Bug Fixes
