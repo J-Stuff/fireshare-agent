@@ -27,12 +27,3 @@ Versioning and releases are fully automatic - there's no manual tagging step. On
    and attaches that installer plus a `.sha256` checksum file to the release that was just
    published. This is the same installer the in-app updater downloads and runs silently, so a
    release isn't usable for auto-update until this job finishes.
-
-## Breaking changes while the version is still `0.x`
-
-`pyproject.toml` doesn't override `major_on_zero`, so it's at PSR's default of `true` - a single
-breaking-change commit (`feat!:`, `fix!:`, or a `BREAKING CHANGE:` footer) right now would jump
-straight from `0.x.y` to `1.0.0`, same as it would from any other version. If you'd rather stay in
-`0.x` through breaking changes during early development and only reach `1.0.0` deliberately, set
-`major_on_zero = false` under `[tool.semantic_release]` in `pyproject.toml` - breaking changes
-then bump minor instead while the major version is `0`.
