@@ -15,6 +15,19 @@ _COLOR_MUTED = ("gray40", "gray65")
 _STATUS_ICON = {"info": "⏳", "success": "✓", "error": "✕"}
 _STATUS_COLOR = {"info": _COLOR_MUTED, "success": _COLOR_SUCCESS, "error": _COLOR_ERROR}
 
+# A window is built from layered surfaces, each a shade apart so the layering itself reads as
+# structure instead of a wash of near-identical gray: the window is the darkest/dimmest surface,
+# the sidebar panel sits a step above it, and cards sit a step above that so they read as
+# distinct, elevated surfaces rather than blending into the page behind them.
+WINDOW_BG = ("gray95", "gray13")
+SIDEBAR_BG = ("gray89", "gray17")
+CARD_BG = ("white", "gray20")
+
+_NAV_FG_DEFAULT = ctk.ThemeManager.theme["CTkButton"]["fg_color"]
+_NAV_HOVER_DEFAULT = ctk.ThemeManager.theme["CTkButton"]["hover_color"]
+_NAV_TEXT_UNSELECTED = ("gray20", "gray85")
+_NAV_HOVER_UNSELECTED = ("gray80", "gray26")
+
 
 def heading_font(size: int = 15) -> ctk.CTkFont:
     return ctk.CTkFont(size=size, weight="bold")
@@ -28,17 +41,62 @@ def caption_font(size: int = 12) -> ctk.CTkFont:
     return ctk.CTkFont(size=size)
 
 
-def scrollable_tab(tab: ctk.CTkFrame) -> ctk.CTkScrollableFrame:
-    """Wraps a CTkTabview tab's content in a scrollable frame so a densely populated tab never
-    gets clipped on a smaller screen or at higher DPI scaling."""
-    container = ctk.CTkScrollableFrame(tab, fg_color="transparent")
-    container.pack(fill="both", expand=True)
-    return container
+def scrollable_panel(parent) -> ctk.CTkScrollableFrame:
+    """A full-size scrollable page for one sidebar section, so a densely populated section never
+    gets clipped on a smaller screen or at higher DPI scaling. Caller is responsible for placing
+    it (grid/pack) - this only builds it."""
+    return ctk.CTkScrollableFrame(parent, fg_color="transparent")
+
+
+class SidebarNav(ctk.CTkFrame):
+    """A vertical, single-select navigation list, styled like the sidebar in a modern settings
+    app: an inactive item is a plain label, the active one is a filled pill in the accent color.
+    Selecting an item shows its associated page and grid_remove()s the others - all pages must
+    already be gridded into the same cell of the shared content area. (CTkScrollableFrame keeps
+    re-raising its own internal canvas, so plain tkraise() between two of them doesn't reliably
+    change which is on top - grid_remove() sidesteps that by actually detaching the hidden ones.)
+    """
+
+    def __init__(self, parent, items: list[tuple[str, str, ctk.CTkBaseClass]], width: int = 184) -> None:
+        # items: (icon, label, page)
+        super().__init__(parent, width=width, corner_radius=14, fg_color=SIDEBAR_BG)
+        self.grid_propagate(False)
+
+        self._buttons: dict[str, ctk.CTkButton] = {}
+        self._pages: dict[str, ctk.CTkBaseClass] = {}
+        self._selected: str | None = None
+
+        for i, (icon, label, page) in enumerate(items):
+            button = ctk.CTkButton(
+                self, text=f"{icon}   {label}", anchor="w", corner_radius=8, height=40,
+                font=body_font(), command=lambda l=label: self.select(l),
+            )
+            button.pack(fill="x", padx=10, pady=(12 if i == 0 else 3, 3))
+            self._buttons[label] = button
+            self._pages[label] = page
+
+        self.select(items[0][1])
+
+    def select(self, label: str) -> None:
+        self._selected = label
+        for name, button in self._buttons.items():
+            is_selected = name == label
+            button.configure(
+                fg_color=_NAV_FG_DEFAULT if is_selected else "transparent",
+                hover_color=_NAV_HOVER_DEFAULT if is_selected else _NAV_HOVER_UNSELECTED,
+                text_color="white" if is_selected else _NAV_TEXT_UNSELECTED,
+            )
+            page = self._pages[name]
+            if is_selected:
+                page.grid(row=0, column=0, sticky="nsew")
+            else:
+                page.grid_remove()
 
 
 def section_card(parent, title: str, subtitle: str | None = None) -> ctk.CTkFrame:
-    """A titled, gently-bordered card. Returns the inner body frame - pack fields into that."""
-    card = ctk.CTkFrame(parent, corner_radius=12, fg_color=("gray90", "gray17"))
+    """A titled card sitting one elevation above the page behind it. Returns the inner body
+    frame - pack fields into that."""
+    card = ctk.CTkFrame(parent, corner_radius=14, fg_color=CARD_BG)
     card.pack(fill="x", padx=2, pady=(0, 14))
 
     ctk.CTkLabel(card, text=title, font=heading_font(), anchor="w").pack(
