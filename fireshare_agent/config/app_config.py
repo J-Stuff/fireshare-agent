@@ -28,22 +28,51 @@ RETRY_BACKOFF_MAX_SECONDS = 3600
 MAX_RETRY_ATTEMPTS_MIN = 1
 MAX_RETRY_ATTEMPTS_MAX = 50
 
+# Upload speed limit, in KB/s (1024-based, matching ui.formatting.format_bytes and therefore the
+# rate the main window shows during a transfer).
+#
+# Unlike the settings above, 0 is meaningful here rather than a mistake - it is the "no limit"
+# state, and it has to be, because that is the default and there is no other natural way to spell
+# it in a numeric field. So the allowed values are 0, or MIN..MAX; anything between 1 and MIN-1 is
+# a typo or a misunderstanding of the unit rather than an intent. The floor matters because the
+# limiter paces *between* chunk requests: at a few hundred bytes a second, a 50MB chunk implies a
+# sleep of over a day, and an agent that looks permanently wedged is a worse outcome than a
+# rejected value. The ceiling is far past any consumer uplink and only exists to catch a stray
+# digit.
+UPLOAD_SPEED_LIMIT_UNLIMITED = 0
+UPLOAD_SPEED_LIMIT_KBPS_MIN = 32
+UPLOAD_SPEED_LIMIT_KBPS_MAX = 1024 * 1024  # 1 GB/s
+
 
 def clamp(value: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
 
 
-def _bounded(raw: Any, default: int, minimum: int, maximum: int) -> int:
-    """Coerces one value from a persisted config into the allowed range. A missing key, or a value
-    that isn't a number at all (config.json is hand-editable, so `"50"` or `null` are both
-    realistic), falls back to the default rather than propagating a bad type into the pipeline."""
+def clamp_speed_limit(value: int) -> int:
+    """The upload speed limit's own clamp, because its valid set has a hole in it: 0 (unlimited),
+    or MIN..MAX. Anything at or below 0 - including a negative from a hand-edited config - reads
+    as "no limit", which is the safe interpretation: it leaves uploads working normally rather
+    than silently throttling them to a crawl."""
+    if value <= 0:
+        return UPLOAD_SPEED_LIMIT_UNLIMITED
+    return clamp(value, UPLOAD_SPEED_LIMIT_KBPS_MIN, UPLOAD_SPEED_LIMIT_KBPS_MAX)
+
+
+def _as_int(raw: Any, default: int) -> int:
+    """One value from a persisted config as an int. A missing key, or a value that isn't a number
+    at all (config.json is hand-editable, so `"50"` or `null` are both realistic), falls back to
+    the default rather than propagating a bad type into the pipeline."""
     if raw is None:
-        raw = default
+        return default
     try:
-        value = int(raw)
+        return int(raw)
     except (TypeError, ValueError):
         return default
-    return clamp(value, minimum, maximum)
+
+
+def _bounded(raw: Any, default: int, minimum: int, maximum: int) -> int:
+    """Coerces one value from a persisted config into the allowed range."""
+    return clamp(_as_int(raw, default), minimum, maximum)
 
 
 @dataclass
@@ -61,6 +90,10 @@ class WebApiSettings:
     ignore_certificate_errors: bool = False
     target_folder: str = ""
     chunk_size_bytes: int = 50 * 1024 * 1024
+    # Ceiling on how fast this agent uploads, in KB/s; 0 means no limit. Lives here rather than on
+    # AppConfig because it is a property of the transport, which means update_config()'s existing
+    # "drop the cached uploader" step already applies a change to it without further plumbing.
+    upload_speed_limit_kbps: int = UPLOAD_SPEED_LIMIT_UNLIMITED
     # When true, a file's Fireshare folder is taken from its local subfolder name relative to
     # whichever watch folder contains it (e.g. ".../captures/HELLDIVERS 2/clip.mp4" -> folder
     # "HELLDIVERS 2"), so ShadowPlay's per-game folder layout carries over instead of everything
@@ -112,6 +145,9 @@ class AppConfig:
         config.web_api.chunk_size_bytes = _bounded(
             config.web_api.chunk_size_bytes, WebApiSettings.chunk_size_bytes,
             CHUNK_SIZE_MB_MIN * 1024 * 1024, CHUNK_SIZE_MB_MAX * 1024 * 1024,
+        )
+        config.web_api.upload_speed_limit_kbps = clamp_speed_limit(
+            _as_int(config.web_api.upload_speed_limit_kbps, WebApiSettings.upload_speed_limit_kbps)
         )
         config.start_with_windows = data.get("start_with_windows", config.start_with_windows)
         config.show_upload_notifications = data.get("show_upload_notifications", config.show_upload_notifications)

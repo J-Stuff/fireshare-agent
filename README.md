@@ -62,7 +62,8 @@ icon and choose **Open Settings**:
   folder) and choose what happens to a file after it's uploaded (leave it, move it to a subfolder,
   or delete it).
 - **Fireshare Account** tab: enter your Fireshare server URL, username, and password, then click
-  **Test Connection** to confirm it works before saving.
+  **Test Connection** to confirm it works before saving. **Upload Options** here also lets you cap
+  how fast the agent uploads - see [Limiting upload speed](#limiting-upload-speed) below.
 - **Advanced** tab: startup, notification, and update-check preferences.
 
 Click **Save** and the agent starts watching immediately - no restart needed.
@@ -107,6 +108,26 @@ seconds of a large upload can briefly be unavailable, and the agent says so
 failure. Wait a moment and click again.
 
 Failed uploads have no link, so **Copy Link** is disabled for them.
+
+## Limiting upload speed
+
+**Settings > Fireshare Account > Upload Options > Upload speed limit (KB/s)** caps how much of
+your upstream the agent will use. `0` (the default) means no limit; otherwise it's 32 KB/s or
+more. Useful if uploading a 4 GB clip in the background otherwise makes the connection unusable
+for whatever you're doing at the time.
+
+Two things worth knowing about how it works:
+
+- **It's an average, not a ceiling on every instant.** The agent uploads one chunk at whatever
+  speed your connection manages, then waits before starting the next one. Over a whole clip the
+  average lands on the limit you set, but each individual chunk still goes out at full speed. If
+  the bursts are what bother you (a spike in your ping every so often, rather than a saturated
+  link overall), lower the **Chunk size** in the same section - smaller chunks mean shorter
+  bursts and smoother pacing.
+- **It only limits this agent.** Nothing else on your PC is affected.
+
+The rate and ETA shown in the main window account for the limit, so a throttled upload reports
+the speed it's actually achieving rather than the one it could.
 
 ## Updating
 

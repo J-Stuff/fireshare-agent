@@ -24,9 +24,13 @@ from fireshare_agent.config.app_config import (
     MAX_RETRY_ATTEMPTS_MIN,
     RETRY_BACKOFF_MAX_SECONDS,
     RETRY_BACKOFF_MIN_SECONDS,
+    UPLOAD_SPEED_LIMIT_KBPS_MAX,
+    UPLOAD_SPEED_LIMIT_KBPS_MIN,
+    UPLOAD_SPEED_LIMIT_UNLIMITED,
     AppConfig,
     WatchFolderConfig,
     clamp,
+    clamp_speed_limit,
 )
 from fireshare_agent.config.secrets import WEB_API_PASSWORD, delete_secret, get_secret, set_secret
 from fireshare_agent.models import PostUploadAction
@@ -246,6 +250,20 @@ class SettingsWindow(ctk.CTkToplevel):
             "Fireshare instance is behind Cloudflare.",
         ).pack(anchor="w", pady=(2, 0))
 
+        self._webapi_speed_limit_entry = widgets.labeled_entry(
+            upload_body, "Upload speed limit (KB/s):", str(s.upload_speed_limit_kbps),
+        )
+        # Says what the limit actually does rather than implying a smoothness it cannot deliver:
+        # pacing happens between chunk requests, so one chunk still goes out as fast as the
+        # connection allows and the chunk size sets how bursty that is. Pointing at the field
+        # directly above turns that from a caveat into something the user can act on.
+        widgets.caption(
+            upload_body,
+            f"0 = no limit, otherwise {UPLOAD_SPEED_LIMIT_KBPS_MIN}-{UPLOAD_SPEED_LIMIT_KBPS_MAX} "
+            "KB/s. Applies to this agent only, and is an average: each chunk uploads at full "
+            "speed and the agent then waits. Lower the chunk size above for smoother pacing.",
+        ).pack(anchor="w", pady=(2, 0))
+
         test_row = ctk.CTkFrame(tab, fg_color="transparent")
         test_row.pack(fill="x", pady=(0, 4))
         ctk.CTkButton(test_row, text="Test Connection", width=140, command=self._test_web_api_connection).pack(side="left")
@@ -428,6 +446,22 @@ class SettingsWindow(ctk.CTkToplevel):
             entry.insert(0, str(value))
         return value
 
+    def _read_speed_limit(self, adjustments: list[str]) -> int:
+        """The upload speed limit field, corrected the same way _read_bounded corrects the others.
+        Separate from it because this setting's valid values are 0 *or* MIN..MAX, so a plain
+        two-sided clamp would quietly turn "no limit" into the slowest allowed limit - the exact
+        opposite of what the user asked for."""
+        typed = _safe_int(self._webapi_speed_limit_entry.get(), UPLOAD_SPEED_LIMIT_UNLIMITED)
+        value = clamp_speed_limit(typed)
+        if value != typed:
+            adjustments.append(
+                f"Upload speed limit must be 0 (no limit) or {UPLOAD_SPEED_LIMIT_KBPS_MIN}-"
+                f"{UPLOAD_SPEED_LIMIT_KBPS_MAX} KB/s (you entered {typed}, using {value})"
+            )
+            self._webapi_speed_limit_entry.delete(0, "end")
+            self._webapi_speed_limit_entry.insert(0, str(value))
+        return value
+
     def _build_config_from_fields(self, persist_secrets: bool, adjustments: list[str] | None = None) -> AppConfig:
         adjustments = adjustments if adjustments is not None else []
         config = copy.deepcopy(self._config)
@@ -447,6 +481,7 @@ class SettingsWindow(ctk.CTkToplevel):
             self._webapi_chunk_entry, 50, CHUNK_SIZE_MB_MIN, CHUNK_SIZE_MB_MAX,
             "Chunk size", "MB", adjustments,
         ) * 1024 * 1024
+        config.web_api.upload_speed_limit_kbps = self._read_speed_limit(adjustments)
 
         webapi_credentials_changed = (
             bool(self._webapi_password_entry.get())

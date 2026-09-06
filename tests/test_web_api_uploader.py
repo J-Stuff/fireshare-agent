@@ -688,3 +688,107 @@ def test_progress_is_optional(tmp_path):
 
     with patch.object(uploader, "_post_chunk"):
         uploader._upload_video_chunked(file)  # must not raise
+
+
+# --- Upload speed limit -------------------------------------------------------------------------
+#
+# The limiter itself is covered in test_throttle.py against a fake clock. What matters here is
+# that the uploader drives it in the right order: wait *before* each send, charge *after*. Getting
+# that backwards would either stall the first chunk of every upload before a byte moved, or delay
+# the success event (and the post-upload move/delete) after the last one.
+
+
+class _RecordingLimiter:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int]] = []
+
+    def wait(self) -> float:
+        self.calls.append(("wait", 0))
+        return 0.0
+
+    def charge(self, num_bytes: int) -> None:
+        self.calls.append(("charge", num_bytes))
+
+
+def test_no_speed_limit_configured_means_the_limiter_is_disabled():
+    uploader = WebApiUploader(_settings())
+
+    assert uploader._throttle.enabled is False
+
+
+def test_a_configured_speed_limit_is_converted_from_kb_to_bytes_per_second():
+    settings = _settings()
+    settings.upload_speed_limit_kbps = 256
+
+    uploader = WebApiUploader(settings)
+
+    assert uploader._throttle.enabled is True
+    assert uploader._throttle._rate == 256 * 1024
+
+
+def test_the_chunk_loop_waits_before_each_send_and_charges_after(tmp_path):
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(b"0123456789")  # 10 bytes, 4-byte chunks -> 4 + 4 + 2
+    settings = _settings()
+    settings.chunk_size_bytes = 4
+    uploader = WebApiUploader(settings)
+    limiter = _RecordingLimiter()
+    uploader._throttle = limiter
+    file = PendingFile(path=str(path), kind=MediaKind.VIDEO, size_bytes=10)
+
+    with patch.object(uploader, "_post_chunk"):
+        uploader._upload_video_chunked(file)
+
+    assert limiter.calls == [
+        ("wait", 0), ("charge", 4),
+        ("wait", 0), ("charge", 4),
+        ("wait", 0), ("charge", 2),
+    ]
+
+
+def test_the_last_chunk_is_charged_but_never_waited_on(tmp_path):
+    """The final wait would delay the SUCCEEDED event and the post-upload action for a file whose
+    bytes the server already has. The charge still lands, so the next file pays for it."""
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(b"01234567")
+    settings = _settings()
+    settings.chunk_size_bytes = 4
+    uploader = WebApiUploader(settings)
+    limiter = _RecordingLimiter()
+    uploader._throttle = limiter
+
+    with patch.object(uploader, "_post_chunk"):
+        uploader._upload_video_chunked(PendingFile(path=str(path), kind=MediaKind.VIDEO, size_bytes=8))
+
+    assert limiter.calls[-1] == ("charge", 4)
+
+
+def test_an_image_upload_is_charged_so_a_batch_still_respects_the_limit(tmp_path):
+    # A screenshot is one unsplittable request, so its own transfer cannot be paced - but a watch
+    # folder filling with hundreds of them at once is exactly why someone sets a limit.
+    path = tmp_path / "shot.png"
+    path.write_bytes(b"x" * 64)
+    uploader = WebApiUploader(_settings())
+    limiter = _RecordingLimiter()
+    uploader._throttle = limiter
+    file = PendingFile(path=str(path), kind=MediaKind.IMAGE, size_bytes=64)
+
+    with patch.object(uploader, "_post_image", return_value=_mock_response()) as post:
+        post.return_value.status_code = 201
+        uploader._upload_image(file)
+
+    assert limiter.calls == [("wait", 0), ("charge", 64)]
+
+
+def test_the_throttle_sleep_is_injectable_so_shutdown_can_cut_it_short():
+    # The pipeline passes a sleep backed by its stop event: stop() gives the upload worker 5
+    # seconds, and a pause at a low limit can be far longer than that.
+    slept: list[float] = []
+    settings = _settings()
+    settings.upload_speed_limit_kbps = 32
+
+    uploader = WebApiUploader(settings, sleep=slept.append)
+    uploader._throttle.charge(32 * 1024 * 3)
+    uploader._throttle.wait()
+
+    assert slept and slept[0] > 0

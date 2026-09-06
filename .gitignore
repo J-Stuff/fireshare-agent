@@ -39,3 +39,6 @@ desktop.ini
 
 # Local working notes (backlog, scratch planning) - not part of the published repo
 /notes/
+
+# Private claude files
+.claude/

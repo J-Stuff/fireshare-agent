@@ -17,6 +17,8 @@ from fireshare_agent.config.app_config import (
     CHUNK_SIZE_MB_MIN,
     MAX_RETRY_ATTEMPTS_MIN,
     RETRY_BACKOFF_MIN_SECONDS,
+    UPLOAD_SPEED_LIMIT_KBPS_MIN,
+    UPLOAD_SPEED_LIMIT_UNLIMITED,
     AppConfig,
 )
 from fireshare_agent.config.secrets import WEB_API_PASSWORD, delete_secret, get_secret, set_secret
@@ -308,5 +310,105 @@ def test_a_successful_test_connection_keeps_the_new_password(tk_root, preserve_w
         assert finished.wait(timeout=10)
 
         assert get_secret(WEB_API_PASSWORD) == "correct-horse"
+    finally:
+        window.destroy()
+
+
+# --- Upload speed limit -------------------------------------------------------------------------
+#
+# 0 means "no limit" here, which is why this field gets its own reader rather than going through
+# _read_bounded: a two-sided clamp would silently turn "no limit" into the slowest allowed limit.
+
+
+def test_zero_speed_limit_saves_as_unlimited_without_complaint(tk_root):
+    saved: list[AppConfig] = []
+    window = SettingsWindow(tk_root, AppConfig(), on_save=saved.append)
+    tk_root.update()
+    try:
+        _set(window._webapi_speed_limit_entry, "0")
+
+        window._save()
+
+        assert len(saved) == 1
+        assert saved[0].web_api.upload_speed_limit_kbps == UPLOAD_SPEED_LIMIT_UNLIMITED
+    finally:
+        if window.winfo_exists():
+            window.destroy()
+
+
+def test_an_in_range_speed_limit_is_saved_as_typed(tk_root):
+    saved: list[AppConfig] = []
+    window = SettingsWindow(tk_root, AppConfig(), on_save=saved.append)
+    tk_root.update()
+    try:
+        _set(window._webapi_speed_limit_entry, "1500")
+
+        window._save()
+
+        assert len(saved) == 1
+        assert saved[0].web_api.upload_speed_limit_kbps == 1500
+    finally:
+        if window.winfo_exists():
+            window.destroy()
+
+
+def test_a_speed_limit_below_the_floor_is_corrected_and_shown(tk_root):
+    window = SettingsWindow(tk_root, AppConfig(), on_save=lambda _c: None)
+    tk_root.update()
+    try:
+        _set(window._webapi_speed_limit_entry, "5")
+
+        adjustments: list[str] = []
+        config = window._build_config_from_fields(persist_secrets=False, adjustments=adjustments)
+
+        assert config.web_api.upload_speed_limit_kbps == UPLOAD_SPEED_LIMIT_KBPS_MIN
+        assert len(adjustments) == 1
+        assert window._webapi_speed_limit_entry.get() == str(UPLOAD_SPEED_LIMIT_KBPS_MIN)
+    finally:
+        window.destroy()
+
+
+def test_a_negative_speed_limit_becomes_unlimited_not_the_floor(tk_root):
+    """The conservative reading: someone who typed a nonsense negative gets uploads that keep
+    working normally, rather than an agent silently throttled to its slowest allowed setting."""
+    window = SettingsWindow(tk_root, AppConfig(), on_save=lambda _c: None)
+    tk_root.update()
+    try:
+        _set(window._webapi_speed_limit_entry, "-100")
+
+        adjustments: list[str] = []
+        config = window._build_config_from_fields(persist_secrets=False, adjustments=adjustments)
+
+        assert config.web_api.upload_speed_limit_kbps == UPLOAD_SPEED_LIMIT_UNLIMITED
+        assert len(adjustments) == 1
+    finally:
+        window.destroy()
+
+
+def test_a_non_numeric_speed_limit_falls_back_to_unlimited_silently(tk_root):
+    # Nothing was "adjusted" from the user's point of view - the field never held a number - so
+    # this must not block Save the way an out-of-range value does.
+    window = SettingsWindow(tk_root, AppConfig(), on_save=lambda _c: None)
+    tk_root.update()
+    try:
+        _set(window._webapi_speed_limit_entry, "as fast as possible")
+
+        adjustments: list[str] = []
+        config = window._build_config_from_fields(persist_secrets=False, adjustments=adjustments)
+
+        assert config.web_api.upload_speed_limit_kbps == UPLOAD_SPEED_LIMIT_UNLIMITED
+        assert adjustments == []
+    finally:
+        window.destroy()
+
+
+def test_a_saved_speed_limit_is_shown_when_settings_reopens(tk_root):
+    config = AppConfig()
+    config.web_api.upload_speed_limit_kbps = 4096
+
+    window = SettingsWindow(tk_root, config, on_save=lambda _c: None)
+    tk_root.update()
+    try:
+        assert window._webapi_speed_limit_entry.get() == "4096"
     finally:
         window.destroy()

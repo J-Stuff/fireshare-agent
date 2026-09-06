@@ -794,3 +794,43 @@ def test_scheduling_after_stop_adds_nothing(tmp_path):
 
     with pipeline._pending_retry_timers_lock:
         assert pipeline._pending_retry_timers == []
+
+
+# --- Upload speed limit plumbing ----------------------------------------------------------------
+
+
+def test_the_uploader_is_built_with_a_sleep_that_shutdown_can_interrupt(tmp_path):
+    """stop() gives this worker 5 seconds to finish, but a speed-limiter pause at a low limit can
+    run to minutes. A plain time.sleep would make every Exit during a throttled upload a hang."""
+    pipeline = _pipeline(tmp_path)
+
+    uploader = pipeline._get_or_create_uploader()
+
+    assert uploader._throttle._sleep == pipeline._interruptible_sleep
+
+
+def test_the_interruptible_sleep_returns_immediately_once_stopping(tmp_path):
+    pipeline = _pipeline(tmp_path)
+    pipeline._stop_event.set()
+
+    started_at = time.monotonic()
+    pipeline._interruptible_sleep(30)
+
+    assert time.monotonic() - started_at < 1.0
+
+
+def test_saving_a_new_speed_limit_rebuilds_the_uploader(tmp_path):
+    # update_config() already drops the cached uploader, which is why the speed limit lives on
+    # WebApiSettings - no extra plumbing is needed for a change to take effect.
+    config = AppConfig()
+    pipeline = _pipeline(tmp_path, config)
+    first = pipeline._get_or_create_uploader()
+    assert first._throttle.enabled is False
+
+    config.web_api.upload_speed_limit_kbps = 512
+    pipeline.update_config(config)
+    second = pipeline._get_or_create_uploader()
+
+    assert second is not first
+    assert second._throttle.enabled is True
+    pipeline.stop()
