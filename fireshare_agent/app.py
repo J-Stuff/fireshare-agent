@@ -88,6 +88,12 @@ class FireshareAgentApp:
         self._sync_lock = threading.Lock()
 
     def run(self) -> None:
+        # Every update we ever applied left its ~60MB installer sitting under %AppData%, one
+        # directory per version, and nothing removed them. Done here rather than after applying an
+        # update, because the installer we would be deleting is the one that just relaunched us -
+        # and done before the tray exists so it cannot overlap a staging download.
+        updater.cleanup_staged_installers()
+
         self.pipeline.start()
         if self.pipeline.is_paused:
             # Pause now survives a restart, which makes this rescan newly dangerous: a paused

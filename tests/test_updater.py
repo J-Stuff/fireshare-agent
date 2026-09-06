@@ -5,7 +5,9 @@ an installer (download/checksum verification, install-mode detection), with the 
 handoff (subprocess.Popen + on_exit) mocked out.
 """
 import hashlib
+import shutil
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -347,3 +349,88 @@ def test_a_hostile_tag_is_dropped_at_check_time(monkeypatch):
     monkeypatch.setattr(updater.requests, "get", lambda *a, **k: response)
 
     assert updater.check_for_update() is None
+
+
+# --- Stale installers. Each applied update staged a ~60MB installer in its own per-version --------
+# directory under %AppData% and nothing ever removed it, so they accumulated one per update for the
+# life of the install. Cleared at boot, the only point where no download can be in flight.
+
+
+def _stage(update_root, version, size=16):
+    directory = update_root / version
+    directory.mkdir(parents=True)
+    (directory / "FireshareAgentSetup.exe").write_bytes(b"x" * size)
+    return directory
+
+
+def test_cleanup_removes_every_staged_installer(tmp_path, monkeypatch):
+    monkeypatch.setattr(updater, "app_data_dir", lambda: tmp_path)
+    update_root = tmp_path / "update"
+    old = _stage(update_root, "1.4.0")
+    newer = _stage(update_root, "1.5.0")
+
+    assert updater.cleanup_staged_installers() == 2
+
+    assert not old.exists()
+    assert not newer.exists()
+    # The root itself stays - apply_update() writes into it, and removing it here would race a
+    # staging mkdir for no benefit.
+    assert update_root.is_dir()
+
+
+def test_cleanup_removes_a_loose_file_in_the_update_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(updater, "app_data_dir", lambda: tmp_path)
+    update_root = tmp_path / "update"
+    update_root.mkdir()
+    stray = update_root / "FireshareAgentSetup.exe"
+    stray.write_bytes(b"downloaded by an older layout")
+
+    assert updater.cleanup_staged_installers() == 1
+    assert not stray.exists()
+
+
+def test_cleanup_is_a_noop_when_nothing_was_ever_staged(tmp_path, monkeypatch):
+    monkeypatch.setattr(updater, "app_data_dir", lambda: tmp_path)
+
+    assert updater.cleanup_staged_installers() == 0
+    assert not (tmp_path / "update").exists()  # does not create the directory just to clean it
+
+
+def test_cleanup_leaves_a_locked_installer_for_the_next_boot(tmp_path, monkeypatch):
+    """The expected failure: right after an update the installer that relaunched us is still
+    running, and Windows locks a running exe's image file. It must not raise, and the entry stays
+    until a later boot can remove it."""
+    monkeypatch.setattr(updater, "app_data_dir", lambda: tmp_path)
+    update_root = tmp_path / "update"
+    locked = _stage(update_root, "1.5.0")
+    removable = _stage(update_root, "1.4.0")
+
+    # Captured first: updater.shutil is the same module object this test imported, so the
+    # setattr below rebinds it globally and calling shutil.rmtree in the fallback would recurse.
+    real_rmtree = shutil.rmtree
+
+    def rmtree(path, *args, **kwargs):
+        if Path(path) == locked:
+            raise PermissionError(32, "The process cannot access the file because it is being used")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(updater.shutil, "rmtree", rmtree)
+
+    assert updater.cleanup_staged_installers() == 1  # only the one it could actually delete
+
+    assert locked.exists()
+    assert not removable.exists()
+
+
+def test_cleanup_touches_nothing_outside_the_update_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(updater, "app_data_dir", lambda: tmp_path)
+    _stage(tmp_path / "update", "1.5.0")
+    config = tmp_path / "config.json"
+    config.write_text("{}")
+    manifest = tmp_path / "manifest.db"
+    manifest.write_bytes(b"sqlite")
+
+    updater.cleanup_staged_installers()
+
+    assert config.exists()
+    assert manifest.exists()
