@@ -598,3 +598,93 @@ def test_a_persisted_session_round_trips(preserve_web_api_session_secret):
     assert {(c.name, c.value, c.domain, c.path) for c in loader._session.cookies} == {
         (c.name, c.value, c.domain, c.path) for c in saver._session.cookies
     }
+
+
+# --------------------------------------------------------------------- upload progress reporting
+#
+# feature-ideas.md #1: a 4 GB clip used to show UPLOADING and then nothing for twenty minutes,
+# with no way to tell a slow upload from a wedged one. The chunk loop already knows exactly how
+# far along it is; these assert that it says so, and that saying so can never break an upload.
+
+
+def test_chunked_upload_reports_progress_after_each_chunk(tmp_path):
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(b"0123456789")
+
+    settings = _settings()
+    settings.chunk_size_bytes = 4
+    uploader = WebApiUploader(settings)
+    file = PendingFile(path=str(path), kind=MediaKind.VIDEO, size_bytes=10)
+
+    reported = []
+    with patch.object(uploader, "_post_chunk"):
+        uploader._upload_video_chunked(file, lambda sent, total: reported.append((sent, total)))
+
+    # Counted only after the POST returns, so these are bytes the server accepted rather than
+    # bytes handed to requests - and the last chunk is short, not padded to the chunk size.
+    assert reported == [(4, 10), (8, 10), (10, 10)]
+
+
+def test_progress_is_reported_at_zero_before_any_bytes_move(tmp_path):
+    """A consumer that only learns about the file from this callback must start at a truthful 0%,
+    not at whatever the first chunk happens to be - which for a small clip is most of the file."""
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(b"0123456789")
+
+    uploader = WebApiUploader(_settings())
+    file = PendingFile(path=str(path), kind=MediaKind.VIDEO, size_bytes=10)
+
+    reported = []
+    with patch.object(uploader, "_ensure_authenticated"), patch.object(uploader, "_upload_video_chunked"):
+        uploader.upload(file, on_progress=lambda sent, total: reported.append((sent, total)))
+
+    assert reported[0] == (0, 10)
+
+
+def test_an_image_upload_reports_completion(tmp_path):
+    """One request, so there is no meaningful mid-transfer progress - but the caller still needs
+    to be told it finished, or a bar sits at 0% until the SUCCEEDED event arrives."""
+    path = tmp_path / "shot.png"
+    path.write_bytes(b"x" * 64)
+
+    uploader = WebApiUploader(_settings())
+    file = PendingFile(path=str(path), kind=MediaKind.IMAGE, size_bytes=64)
+
+    response = _mock_response({})
+    response.status_code = 201
+    reported = []
+    with patch.object(uploader, "_post_image", return_value=response):
+        uploader._upload_image(file, lambda sent, total: reported.append((sent, total)))
+
+    assert reported == [(64, 64)]
+
+
+def test_a_progress_callback_that_raises_never_fails_the_upload(tmp_path):
+    """The consumer is UI state. A multi-gigabyte transfer that is going fine has no business
+    failing because a window was destroyed mid-callback."""
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(b"0123456789")
+
+    settings = _settings()
+    settings.chunk_size_bytes = 4
+    uploader = WebApiUploader(settings)
+    file = PendingFile(path=str(path), kind=MediaKind.VIDEO, size_bytes=10)
+
+    def explode(sent, total):
+        raise RuntimeError("the window went away")
+
+    with patch.object(uploader, "_post_chunk"):
+        uploader._upload_video_chunked(file, explode)  # must not raise
+
+
+def test_progress_is_optional(tmp_path):
+    """The Uploader contract makes the callback optional, so the helpers have to cope without
+    one rather than requiring every caller to supply a no-op."""
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(b"0123456789")
+
+    uploader = WebApiUploader(_settings())
+    file = PendingFile(path=str(path), kind=MediaKind.VIDEO, size_bytes=10)
+
+    with patch.object(uploader, "_post_chunk"):
+        uploader._upload_video_chunked(file)  # must not raise

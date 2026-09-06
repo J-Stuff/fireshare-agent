@@ -6,13 +6,19 @@ multiple gigabytes.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Callable
 
 from fireshare_agent.models import ConnectionTestResult, PendingFile, UploadResult
+
+# (bytes_sent, total_bytes) as the transfer advances, called from whichever thread is driving
+# upload(). Implementations must treat it as advisory: it is optional, it may be slow, and an
+# exception out of it must never fail an upload that is otherwise succeeding.
+ProgressCallback = Callable[[int, int], None]
 
 
 class Uploader(ABC):
     @abstractmethod
-    def upload(self, file: PendingFile) -> UploadResult:
+    def upload(self, file: PendingFile, on_progress: ProgressCallback | None = None) -> UploadResult:
         ...
 
     @abstractmethod

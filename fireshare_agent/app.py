@@ -13,10 +13,10 @@ from fireshare_agent import __version__, assets, updater
 from fireshare_agent.config import store as config_store
 from fireshare_agent.config.app_config import AppConfig
 from fireshare_agent.manifest.store import ManifestStore
-from fireshare_agent.pipeline.activity import PipelineActivity, PipelineEventKind
+from fireshare_agent.pipeline.activity import FILELESS_EVENT_KINDS, PipelineActivity, PipelineEventKind
 from fireshare_agent.pipeline.upload_pipeline import UploadPipeline
-from fireshare_agent.ui import mfa_dialog
-from fireshare_agent.ui.activity_window import ActivityWindow
+from fireshare_agent.ui import formatting, mfa_dialog
+from fireshare_agent.ui.main_window import MainWindow
 from fireshare_agent.ui.settings_window import SettingsWindow
 from fireshare_agent.ui.tray import TrayIcon
 
@@ -81,7 +81,7 @@ class FireshareAgentApp:
         self.pipeline.add_activity_listener(self._on_activity)
 
         self.settings_window: SettingsWindow | None = None
-        self.activity_window: ActivityWindow | None = None
+        self.main_window: MainWindow | None = None
         self.tray: TrayIcon | None = None
         self._update_info: updater.UpdateInfo | None = None
         self._sync_thread: threading.Thread | None = None
@@ -101,7 +101,7 @@ class FireshareAgentApp:
 
         self.tray = TrayIcon(
             on_open_settings=lambda: self.run_on_ui_thread(self.open_settings),
-            on_open_activity=lambda: self.run_on_ui_thread(self.open_activity),
+            on_open_main_window=lambda: self.run_on_ui_thread(self.open_main_window),
             on_sync_now=self._start_sync,
             on_toggle_pause=self._toggle_pause,
             is_paused=lambda: self.pipeline.is_paused,
@@ -111,6 +111,9 @@ class FireshareAgentApp:
             update_version=lambda: self._update_info.version if self._update_info else "",
             on_update_now=lambda: self.run_on_ui_thread(self.confirm_and_apply_update),
             pending_review_count=lambda: self.pipeline.pending_review_count,
+            # Read on every hover and on every progress tick, so it has to be a live callback
+            # rather than a string computed once at construction.
+            tooltip=lambda: formatting.tray_tooltip(self.pipeline.get_status()),
         )
         tray_thread = threading.Thread(target=self.tray.run, daemon=True, name="fireshare-agent-tray")
         tray_thread.start()
@@ -164,13 +167,30 @@ class FireshareAgentApp:
             on_check_for_updates=lambda: self.check_for_updates(notify_if_none=True),
         )
 
-    def open_activity(self) -> None:
-        if self.activity_window is not None and self.activity_window.winfo_exists():
-            self.activity_window.refresh()
-            self.activity_window.lift()
-            self.activity_window.focus_force()
+    def open_main_window(self) -> None:
+        """Shows the agent's main window, building it the first time it is asked for.
+
+        Kept alive and hidden thereafter rather than destroyed on close: it is now the window the
+        app is driven from, and rebuilding a few hundred widgets - and losing the user's filter,
+        search, and scroll position - every time they glance at the tray would be the wrong
+        trade. `winfo_exists()` is still checked because Tk can tear a Toplevel down underneath
+        us during shutdown."""
+        if self.main_window is not None and self.main_window.winfo_exists():
+            self.main_window.show()
             return
-        self.activity_window = ActivityWindow(self.root, self.manifest, self.pipeline)
+
+        self.main_window = MainWindow(
+            self.root, self.manifest, self.pipeline,
+            config_provider=lambda: self.config,
+            on_open_settings=self.open_settings,
+            on_sync_now=self._start_sync,
+            on_toggle_pause=self._toggle_pause,
+            on_exit=self.exit_app,
+            version=__version__,
+            has_update=lambda: self._update_info is not None,
+            update_version=lambda: self._update_info.version if self._update_info else "",
+            on_update_now=self.confirm_and_apply_update,
+        )
 
     def _on_settings_saved(self, new_config: AppConfig) -> None:
         self.config = new_config
@@ -181,6 +201,7 @@ class FireshareAgentApp:
         # so the tray can never keep asserting a state the pipeline has moved on from.
         if self.tray:
             self.tray.refresh()
+        self._refresh_main_window()
         log.info("Settings saved; watcher and uploader reconfigured.")
 
     def _toggle_pause(self) -> None:
@@ -190,6 +211,19 @@ class FireshareAgentApp:
             self.pipeline.pause()
         if self.tray:
             self.tray.refresh()
+        self._refresh_main_window()
+
+    def _refresh_main_window(self) -> None:
+        """Redraws the main window if it exists and is on screen. A hidden window refreshes
+        itself when it is shown again, so nudging one here would be wasted work."""
+        window = self.main_window
+        if window is None or not window.winfo_exists():
+            return
+        try:
+            if window.winfo_viewable():
+                window.refresh()
+        except Exception:
+            log.debug("Could not refresh the main window.", exc_info=True)
 
     def check_for_updates(self, notify_if_none: bool = True) -> None:
         """Runs the (network) version check on a background thread so it never blocks the UI
@@ -256,23 +290,37 @@ class FireshareAgentApp:
         return result["code"]
 
     def _on_activity(self, activity: PipelineActivity) -> None:
-        # WAITING can repeat every ~15s for a long-running recording still being written; log
-        # it at DEBUG so a multi-hour session doesn't flood the (size-capped) log file.
-        level = logging.DEBUG if activity.event_kind == PipelineEventKind.WAITING else logging.INFO
-        log.log(level, "%s: %s%s", activity.event_kind.value, activity.path, f" ({activity.message})" if activity.message else "")
+        log.log(*_log_line_for(activity))
 
-        if self.tray and activity.event_kind in (
-            PipelineEventKind.SUCCEEDED, PipelineEventKind.FAILED, PipelineEventKind.ALREADY_AT_DESTINATION,
+        if activity.event_kind == PipelineEventKind.PROGRESS:
+            # Only the hover text moves during a transfer. Going through the full tray refresh
+            # here would rebuild the icon bitmap and the native menu roughly once a second for
+            # the length of the upload.
+            if self.tray:
+                self.run_on_ui_thread(self.tray.refresh_tooltip)
+            return
+
+        if self.tray and activity.event_kind == PipelineEventKind.UPLOADING:
+            # A transfer starting changes the hover text but neither the icon nor the menu.
+            self.run_on_ui_thread(self.tray.refresh_tooltip)
+        elif self.tray and activity.event_kind in (
+            PipelineEventKind.SUCCEEDED, PipelineEventKind.FAILED,
+            PipelineEventKind.ALREADY_AT_DESTINATION, PipelineEventKind.IDLE,
         ):
+            # These move the failure badge and the "Review N File(s)" menu entry, so the icon and
+            # the menu both have to be rebuilt.
             self.run_on_ui_thread(self.tray.refresh)
+
+        if activity.event_kind == PipelineEventKind.IDLE:
+            return  # nothing to notify about; the log line and the window's status card say it
 
         if self.config.show_upload_notifications and self.tray:
             if activity.event_kind == PipelineEventKind.SUCCEEDED:
                 self._notify(f"Uploaded {_short_name(activity.path)}")
             elif activity.event_kind == PipelineEventKind.ALREADY_AT_DESTINATION:
                 self._notify(
-                    f"Already on Fireshare: {_short_name(activity.path)} - open the tray menu to "
-                    "review what happens to the local copy."
+                    f"Already on Fireshare: {_short_name(activity.path)} - open Fireshare Agent "
+                    "to choose what happens to the local copy."
                 )
             elif activity.event_kind == PipelineEventKind.FAILED:
                 self._notify(f"Failed to upload {_short_name(activity.path)}: {activity.message}")
@@ -295,6 +343,29 @@ class FireshareAgentApp:
         self.root.quit()
         self.root.destroy()
         sys.exit(0)
+
+
+def _log_line_for(activity: PipelineActivity) -> tuple:
+    """(level, format, *args) for one activity event.
+
+    Split out from _on_activity so the level rules are stated in one place and can be checked in
+    a test. Both WAITING and PROGRESS are high-frequency - WAITING repeats every ~15s for a
+    recording still being written, and PROGRESS fires about once a second for the whole length of
+    a transfer - so both are DEBUG, which under the app's INFO root logger means they are never
+    written to the size-capped agent.log at all."""
+    noisy = activity.event_kind in (PipelineEventKind.WAITING, PipelineEventKind.PROGRESS)
+    level = logging.DEBUG if noisy else logging.INFO
+
+    percent = activity.percent
+    if percent is not None:
+        return (level, "%s: %s (%.0f%%)", activity.event_kind.value, activity.path, percent)
+
+    detail = f" ({activity.message})" if activity.message else ""
+    if activity.event_kind in FILELESS_EVENT_KINDS:
+        # IDLE describes the pipeline, not a file. Rendering it through the normal format would
+        # print a stray empty path where every other line has a filename.
+        return (level, "%s%s", activity.event_kind.value, detail)
+    return (level, "%s: %s%s", activity.event_kind.value, activity.path, detail)
 
 
 def _short_name(path: str) -> str:

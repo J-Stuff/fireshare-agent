@@ -11,6 +11,7 @@ event loop and frozen the settings and activity windows instead.
 Also covers the update-check response, reported by J: "Check for Updates Now" looked like it did
 nothing whenever an update was actually available.
 """
+import logging
 import threading
 
 import pytest
@@ -23,6 +24,8 @@ from fireshare_agent.app import (
     decide_update_check_response,
 )
 from fireshare_agent.config.app_config import AppConfig
+from fireshare_agent.models import MediaKind
+from fireshare_agent.pipeline.activity import PipelineActivity, PipelineEventKind
 
 
 class _FakeRoot:
@@ -366,3 +369,57 @@ def test_an_automatic_check_never_opens_a_dialog(monkeypatch):
     assert instance.info_dialogs == []
     assert len(instance.notifications) == 1
     assert "9.9.9" in instance.notifications[0]
+
+
+# ------------------------------------------------------------------------ activity log levels
+#
+# feature-ideas.md #1 named the trap directly: the activity listener logs every event, so a
+# per-chunk PROGRESS would flood the size-capped agent.log - the same trap WAITING already fell
+# into. Under the app's INFO root logger, DEBUG here means those lines are never written at all.
+
+
+def test_progress_events_are_logged_at_debug():
+    level, *_ = app_module._log_line_for(
+        PipelineActivity(
+            path="clip.mp4", kind=MediaKind.VIDEO, event_kind=PipelineEventKind.PROGRESS,
+            bytes_sent=50, total_bytes=100,
+        )
+    )
+    assert level == logging.DEBUG
+
+
+def test_waiting_events_are_still_logged_at_debug():
+    level, *_ = app_module._log_line_for(
+        PipelineActivity(path="clip.mp4", kind=MediaKind.VIDEO, event_kind=PipelineEventKind.WAITING)
+    )
+    assert level == logging.DEBUG
+
+
+def test_outcomes_are_logged_at_info():
+    for kind in (PipelineEventKind.SUCCEEDED, PipelineEventKind.FAILED, PipelineEventKind.IDLE):
+        level, *_ = app_module._log_line_for(
+            PipelineActivity(path="clip.mp4", kind=MediaKind.VIDEO, event_kind=kind)
+        )
+        assert level == logging.INFO
+
+
+def test_a_progress_line_carries_the_percentage():
+    level, fmt, *args = app_module._log_line_for(
+        PipelineActivity(
+            path="clip.mp4", kind=MediaKind.VIDEO, event_kind=PipelineEventKind.PROGRESS,
+            bytes_sent=43, total_bytes=100,
+        )
+    )
+    assert (fmt % tuple(args)) == "progress: clip.mp4 (43%)"
+
+
+def test_an_idle_line_does_not_print_a_stray_empty_path():
+    """IDLE describes the pipeline, not a file, so its path is empty. Rendered through the normal
+    format it would leave a gap where every other line has a filename."""
+    level, fmt, *args = app_module._log_line_for(
+        PipelineActivity(
+            path="", kind=MediaKind.VIDEO, event_kind=PipelineEventKind.IDLE,
+            message="No files left to upload",
+        )
+    )
+    assert (fmt % tuple(args)) == "idle (No files left to upload)"
