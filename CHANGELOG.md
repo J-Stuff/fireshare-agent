@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.5.2 (2026-09-06)
+
+### Bug Fixes
+
+- Remove stale update installers at startup
+  ([`5302e7b`](https://github.com/J-Stuff/fireshare-agent/commit/5302e7b45c098f6377ff3673a1384ceaf01c47c2))
+
+
 ## v1.5.1 (2026-09-06)
 
 ### Bug Fixes
