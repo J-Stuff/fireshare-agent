@@ -5,6 +5,13 @@ chunked endpoint so a single clip can be split into sub-100MB requests, which is
 survive a Cloudflare-fronted Fireshare instance despite Cloudflare's 100MB request-body cap.
 Screenshots are small enough to go through the plain single-request image endpoint.
 
+Share links are not returned by the upload endpoints - both `/api/uploadChunked` and
+`/api/upload/image` end in a bare `Response(status=201)` with no body (confirmed against the
+server source). The row that carries the id is created afterwards by `fireshare scan-video`,
+which the server launches as a *separate process*, so the id does not exist yet when the 201
+arrives. Resolving a link therefore means looking the file back up by name - see
+`resolve_share_url` below.
+
 Note: Fireshare's chunked endpoint does NOT validate the `checkSum` field against file content
 (confirmed against the server source) - it only uses it as a grouping key for the chunk parts on
 disk, so a random per-upload token is used rather than computing a real file hash.
@@ -33,11 +40,32 @@ import urllib3
 from fireshare_agent.config.app_config import WebApiSettings
 from fireshare_agent.config.secrets import WEB_API_PASSWORD, WEB_API_SESSION_COOKIES, delete_secret, get_secret, set_secret
 from fireshare_agent.models import ConnectionTestResult, MediaKind, PendingFile, UploadResult
-from fireshare_agent.uploaders.base import Uploader
+from fireshare_agent.uploaders.base import ProgressCallback, Uploader
+
+log = logging.getLogger(__name__)
 
 log = logging.getLogger(__name__)
 
 _EXISTING_ENTRIES_CACHE_TTL_SECONDS = 60
+
+# `/api/videos` reads its sort with `request.args.get('sort')` - no default - and 400s on anything
+# outside its allowlist. Omitting it (as this uploader used to) meant every video duplicate check
+# got a 400, which raise_for_status turned into an exception that exists_at_destination swallowed
+# into "not a duplicate, upload anyway" - silently disabling one of the agent's two layers of
+# duplicate protection for videos. `/api/images` defaults the same parameter, so images were
+# unaffected. This value is on both endpoints' allowlists.
+_LIST_SORT = "updated_at desc"
+
+# Fireshare's own UI builds a share link as `{base}/w/{video_id}` for a video and
+# `{base}/i/{image_id}` for an image (app/client/src/common/utils.js).
+_SHARE_PATH = {MediaKind.VIDEO: "/w/", MediaKind.IMAGE: "/i/"}
+_ID_FIELD = {MediaKind.VIDEO: "video_id", MediaKind.IMAGE: "image_id"}
+
+# `ui_config.shareable_link_domain` from GET /api/config, when an admin has set one, replaces the
+# server's own address in every link the web UI hands out. An agent that ignored it would produce
+# links that work for the user but not for whoever they are sending them to - which is the entire
+# point of copying one.
+_CONFIG_CACHE_TTL_SECONDS = 300
 
 # Bumped whenever the persisted-session envelope changes shape. v1 stored a flat {name: value}
 # map, which lost every cookie attribute; anything that isn't the current version is discarded and
@@ -78,14 +106,20 @@ class WebApiUploader(Uploader):
         self._authenticated = False
         self._resume_attempted = False
         self._existing_entries_cache: dict[MediaKind, tuple[float, list[dict]]] = {}
+        self._share_base_cache: tuple[float, str] | None = None
 
-    def upload(self, file: PendingFile) -> UploadResult:
+    def upload(self, file: PendingFile, on_progress: ProgressCallback | None = None) -> UploadResult:
+        report = _safe_progress(on_progress)
+        # Reported before a single byte moves so a consumer that only learns about the file from
+        # this callback still starts at a truthful 0% rather than at whatever the first chunk
+        # happens to be - which for a small clip is most of the file at once.
+        report(0, file.size_bytes)
         try:
             self._ensure_authenticated()
             if file.kind == MediaKind.VIDEO:
-                self._upload_video_chunked(file)
+                self._upload_video_chunked(file, report)
             else:
-                self._upload_image(file)
+                self._upload_image(file, report)
             # Otherwise exists_at_destination() could serve a stale cached list (up to 60s old)
             # for the next file in the same batch and miss what was just uploaded.
             self._existing_entries_cache.pop(file.kind, None)
@@ -230,7 +264,7 @@ class WebApiUploader(Uploader):
             return file.remote_folder_hint
         return self._settings.target_folder
 
-    def _upload_video_chunked(self, file: PendingFile) -> None:
+    def _upload_video_chunked(self, file: PendingFile, report: ProgressCallback | None = None) -> None:
         chunk_size = max(1, self._settings.chunk_size_bytes)
         total_chunks = max(1, -(-file.size_bytes // chunk_size))  # ceil division
         file_name = Path(file.path).name
@@ -244,11 +278,19 @@ class WebApiUploader(Uploader):
         # just get overwritten with identical bytes - so the upload can still complete across
         # attempts instead of leaking a little more server disk space each time.
         check_sum = hashlib.sha256(f"{file.path}:{file.size_bytes}".encode("utf-8")).hexdigest()[:24]
+        report = _safe_progress(report)
 
+        sent = 0
         with open(file.path, "rb") as f:
             for part in range(1, total_chunks + 1):  # Fireshare's chunk loop is 1-indexed
                 chunk = f.read(chunk_size)
                 self._post_chunk(chunk, part, total_chunks, check_sum, file_name, file.size_bytes, folder)
+                # Counted only after the POST returns, so the number reported is bytes the server
+                # has actually accepted rather than bytes handed to requests. A retried chunk (see
+                # _post_chunk's 401 path) resends the same bytes into the same group, so it must
+                # not be counted twice either.
+                sent += len(chunk)
+                report(sent, file.size_bytes)
 
     def _post_chunk(self, chunk: bytes, part: int, total_chunks: int, check_sum: str, file_name: str, size_bytes: int, folder: str) -> None:
         data = {
@@ -281,7 +323,12 @@ class WebApiUploader(Uploader):
         if response.status_code not in (200, 201, 202):
             response.raise_for_status()
 
-    def _upload_image(self, file: PendingFile) -> None:
+    def _upload_image(self, file: PendingFile, report: ProgressCallback | None = None) -> None:
+        """Screenshots go up in one request, so there is no meaningful mid-transfer progress to
+        report - this jumps 0 -> 100 on success. Wrapping the file object to report as requests
+        reads it would report bytes buffered, not bytes accepted, and for a file this small the
+        distinction is the whole of the transfer."""
+        report = _safe_progress(report)
         file_name = Path(file.path).name
         folder = self._resolve_folder(file)
         data = {"folder": folder} if folder else {}
@@ -293,6 +340,7 @@ class WebApiUploader(Uploader):
             response = self._post_image(file.path, file_name, data)
 
         response.raise_for_status()
+        report(file.size_bytes, file.size_bytes)
 
     def _post_image(self, path: str, file_name: str, data: dict[str, str]) -> requests.Response:
         with open(path, "rb") as f:
@@ -313,9 +361,19 @@ class WebApiUploader(Uploader):
         conservative: any failure to determine an answer returns False and lets the normal
         upload proceed rather than risk skipping a genuinely new file."""
         try:
-            entries = self._fetch_existing_entries(file.kind)
+            return self._find_existing_entry(file) is not None
         except (requests.RequestException, MfaRequiredError):
             return False
+
+    def _find_existing_entry(self, file: PendingFile, force_refresh: bool = False) -> dict | None:
+        """The server-side row for this file, or None if there isn't one.
+
+        The matching half of exists_at_destination, split out so resolving a share link can reuse
+        it rather than re-deriving the same normalized-name-and-folder comparison. Unlike
+        exists_at_destination this propagates request errors - a caller looking up a link wants to
+        know the lookup failed, whereas a duplicate check deliberately treats "cannot tell" as
+        "not a duplicate"."""
+        entries = self._fetch_existing_entries(file.kind, force_refresh=force_refresh)
 
         target_stem = _normalize_filename(Path(file.path).name)
         target_ext = Path(file.path).suffix.lstrip(".").lower()
@@ -342,21 +400,77 @@ class WebApiUploader(Uploader):
             if target_folder and stored_folder and stored_folder != target_folder:
                 continue  # same filename, different folder - treat as a distinct file
 
-            return True
-        return False
+            return entry
+        return None
 
-    def _fetch_existing_entries(self, kind: MediaKind) -> list[dict]:
+    def _fetch_existing_entries(self, kind: MediaKind, force_refresh: bool = False) -> list[dict]:
+        """force_refresh skips the cache. Needed when looking up a file that was uploaded seconds
+        ago: a cached list up to a minute old predates it by definition, and would report the
+        upload as missing rather than as still being processed."""
         cached = self._existing_entries_cache.get(kind)
-        if cached is not None and time.monotonic() - cached[0] < _EXISTING_ENTRIES_CACHE_TTL_SECONDS:
+        if not force_refresh and cached is not None and time.monotonic() - cached[0] < _EXISTING_ENTRIES_CACHE_TTL_SECONDS:
             return cached[1]
 
         self._ensure_authenticated()
         endpoint, key = ("/api/videos", "videos") if kind == MediaKind.VIDEO else ("/api/images", "images")
-        response = self._session.get(self._url(endpoint), timeout=30)
+        response = self._session.get(self._url(endpoint), params={"sort": _LIST_SORT}, timeout=30)
         response.raise_for_status()
         entries = response.json().get(key, [])
         self._existing_entries_cache[kind] = (time.monotonic(), entries)
         return entries
+
+    def resolve_share_url(self, file: PendingFile, force_refresh: bool = True) -> str | None:
+        """The public Fireshare link for a file this agent has uploaded, or None if the server
+        does not know about it yet.
+
+        None is a genuinely expected answer, not just an error case: the upload endpoint returns
+        201 as soon as the bytes are reassembled, and the database row carrying the id is written
+        afterwards by a `fireshare scan-video` process the server spawns separately. A link asked
+        for immediately after an upload can legitimately not exist for a while.
+
+        Raises on a request failure so the caller can tell "not there yet" (retry) apart from
+        "could not ask" (report it)."""
+        entry = self._find_existing_entry(file, force_refresh=force_refresh)
+        if entry is None:
+            return None
+
+        identifier = entry.get(_ID_FIELD[file.kind])
+        if not identifier:
+            return None  # a row without an id is not something a link can be built from
+
+        return f"{self._share_base_url()}{_SHARE_PATH[file.kind]}{identifier}"
+
+    def _share_base_url(self) -> str:
+        """The origin share links are built on: the admin-configured `shareable_link_domain` when
+        there is one, otherwise the server this agent uploads to.
+
+        Cached for a few minutes - it is one more request per link resolution otherwise, and this
+        is a setting an admin changes approximately never. Any failure to read it falls back to
+        the configured base_url, which is the same thing Fireshare's UI does when the setting is
+        absent."""
+        if self._share_base_cache is not None and time.monotonic() - self._share_base_cache[0] < _CONFIG_CACHE_TTL_SECONDS:
+            return self._share_base_cache[1]
+
+        base = _normalized_base_url(self._settings.base_url)
+        try:
+            response = self._session.get(self._url("/api/config"), timeout=15)
+            response.raise_for_status()
+            configured = (response.json() or {}).get("shareable_link_domain") or ""
+        except (requests.RequestException, ValueError):
+            configured = ""  # unreachable or not JSON - fall back to the upload target
+
+        configured = _normalized_base_url(configured)
+        if configured:
+            # The web UI concatenates this verbatim, so a value saved without a scheme would
+            # produce "example.com/w/abc" - not a link anything can open. Borrow the scheme the
+            # agent is already talking to the server with rather than assuming https.
+            if "://" not in configured:
+                scheme = urlparse(self._settings.base_url).scheme or "https"
+                configured = f"{scheme}://{configured}"
+            base = configured
+
+        self._share_base_cache = (time.monotonic(), base)
+        return base
 
     def list_upload_folders(self) -> list[str]:
         """Populates the folder picker in Settings via GET /api/upload-folders. Routed through
@@ -383,3 +497,22 @@ def _normalize_filename(name: str) -> str:
     letters/digits removed. Not trying to replicate Werkzeug's secure_filename exactly - just
     needs to treat "My Clip.mp4" and "my_clip.mp4" as the same file for dedupe purposes."""
     return re.sub(r"[^a-z0-9]+", "", Path(name).stem.lower())
+
+
+def _safe_progress(on_progress: ProgressCallback | None) -> ProgressCallback:
+    """Normalizes an optional, caller-supplied callback into one that is always callable and can
+    never break an upload.
+
+    The consumer on the other end of this is UI state - a progress bar, a tray tooltip - and a
+    multi-gigabyte transfer that is going fine has no business failing because a window was
+    destroyed mid-callback."""
+    if on_progress is None:
+        return lambda sent, total: None
+
+    def report(sent: int, total: int) -> None:
+        try:
+            on_progress(sent, total)
+        except Exception:
+            log.debug("An upload progress callback raised; ignoring it.", exc_info=True)
+
+    return report

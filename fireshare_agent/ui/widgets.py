@@ -19,6 +19,25 @@ _COLOR_LINK = ("#0b5cad", "#69b7ff")
 _STATUS_ICON = {"info": "⏳", "success": "✓", "error": "✕"}
 _STATUS_COLOR = {"info": _COLOR_MUTED, "success": _COLOR_SUCCESS, "error": _COLOR_ERROR}
 
+# Named so other modules can colour non-CTk things (text tags) with the same palette the widgets
+# use, instead of re-inventing a second set of greens and reds that drift apart.
+COLOR_SUCCESS = _COLOR_SUCCESS
+COLOR_ERROR = _COLOR_ERROR
+COLOR_MUTED = _COLOR_MUTED
+COLOR_WARNING = _COLOR_WARNING
+COLOR_LINK = _COLOR_LINK
+
+
+def resolve_color(color) -> str:
+    """Collapses a CustomTkinter (light, dark) colour pair down to the one currently in effect.
+
+    CTk widgets take the pair and pick for themselves, but a raw Tk text tag cannot - and the
+    history view is a Tk text widget under the CTk wrapper. Anything already a plain string
+    passes straight through, so callers can mix the two freely."""
+    if isinstance(color, (tuple, list)):
+        return color[1] if ctk.get_appearance_mode() == "Dark" else color[0]
+    return color
+
 # A window is built from layered surfaces, each a shade apart so the layering itself reads as
 # structure instead of a wash of near-identical gray: the window is the darkest/dimmest surface,
 # the sidebar panel sits a step above it, and cards sit a step above that so they read as

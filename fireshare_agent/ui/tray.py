@@ -47,7 +47,7 @@ class TrayIcon:
     def __init__(
         self,
         on_open_settings: Callable[[], None],
-        on_open_activity: Callable[[], None],
+        on_open_main_window: Callable[[], None],
         on_sync_now: Callable[[], None],
         on_toggle_pause: Callable[[], None],
         is_paused: Callable[[], bool],
@@ -57,7 +57,11 @@ class TrayIcon:
         update_version: Callable[[], str] = lambda: "",
         on_update_now: Callable[[], None] = lambda: None,
         pending_review_count: Callable[[], int] = lambda: 0,
+        tooltip: Callable[[], str] | None = None,
     ) -> None:
+        # Falls back to the plain paused/not-paused text when no richer source is supplied, so a
+        # caller that does not care about live progress gets the old behaviour.
+        self._tooltip = tooltip or self._default_title
         self._is_paused = is_paused
         self._has_failures = has_failures
         self._has_update = has_update
@@ -80,11 +84,18 @@ class TrayIcon:
                 ),
                 pystray.MenuItem(
                     lambda item: f"Review {self._pending_review_count()} File(s)...",
-                    lambda: on_open_activity(),
+                    lambda: on_open_main_window(),
                     visible=lambda item: self._pending_review_count() > 0,
                 ),
+                # default=True is what makes a plain left-click on the tray icon open this,
+                # rather than doing nothing: pystray's Windows backend calls the icon on
+                # WM_LBUTTONUP, and the icon invokes whichever menu item is marked default.
+                # It must be an item that is always visible - the conditional entries above are
+                # skipped when hidden, and a default nobody can reach is no default at all.
+                pystray.MenuItem(
+                    "Open Fireshare Agent", lambda: on_open_main_window(), default=True,
+                ),
                 pystray.MenuItem("Open Settings", lambda: on_open_settings()),
-                pystray.MenuItem("View Activity / Log", lambda: on_open_activity()),
                 pystray.MenuItem("Sync Now", lambda: on_sync_now()),
                 pystray.MenuItem(
                     lambda item: "Resume Watching" if self._is_paused() else "Pause Watching",
@@ -96,12 +107,23 @@ class TrayIcon:
         )
 
     def _title(self) -> str:
+        return self._tooltip()
+
+    def _default_title(self) -> str:
         return "Fireshare Agent (paused)" if self._is_paused() else "Fireshare Agent"
 
     def refresh(self) -> None:
         self.icon.icon = _build_icon_image(self._is_paused(), self._has_failures())
         self.icon.title = self._title()
         self.icon.update_menu()
+
+    def refresh_tooltip(self) -> None:
+        """Updates only the hover text.
+
+        Split out from refresh() because upload progress moves about once a second, and
+        update_menu() rebuilds the whole native menu - work worth doing when the pause state or
+        the failure badge changes, and pure waste eighty times during one large upload."""
+        self.icon.title = self._title()
 
     def run(self) -> None:
         self.icon.run()

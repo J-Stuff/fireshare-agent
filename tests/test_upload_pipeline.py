@@ -32,15 +32,21 @@ class _FakeUploader:
     """A stand-in uploader whose upload() returns a scripted sequence of results, so a retry
     scenario can be driven without a real Fireshare server."""
 
-    def __init__(self, results: list[UploadResult]) -> None:
+    def __init__(self, results: list[UploadResult], progress_steps: list[int] | None = None) -> None:
         self._results = list(results)
+        self._progress_steps = list(progress_steps or [])
         self.call_count = 0
+        self.received_progress_callback = False
 
     def exists_at_destination(self, file) -> bool:
         return False
 
-    def upload(self, file) -> UploadResult:
+    def upload(self, file, on_progress=None) -> UploadResult:
         self.call_count += 1
+        self.received_progress_callback = on_progress is not None
+        if on_progress is not None:
+            for sent in self._progress_steps:
+                on_progress(sent, file.size_bytes)
         return self._results.pop(0)
 
 
@@ -277,7 +283,7 @@ class _AlreadyThereUploader:
     def exists_at_destination(self, file) -> bool:
         return True
 
-    def upload(self, file) -> UploadResult:  # pragma: no cover - must never be reached
+    def upload(self, file, on_progress=None) -> UploadResult:  # pragma: no cover - must never be reached
         raise AssertionError("upload() must not be called for a file already at the destination")
 
 

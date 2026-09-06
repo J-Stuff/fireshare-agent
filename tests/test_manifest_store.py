@@ -154,3 +154,76 @@ def test_agent_state_table_is_created_in_a_database_that_predates_it(tmp_path):
     store.set_watching_paused(True)
     assert store.is_watching_paused() is True
     assert store.is_already_handled("fp1") is True  # upgrade did not disturb existing history
+
+
+# --------------------------------------------------------------------------- revision & stats
+#
+# The main window auto-refreshes its history every five seconds (GitHub issue #7). Rebuilding a
+# two-hundred-row view on every tick would throw away the user's scroll position and selection,
+# so the window compares `revision` and skips the rebuild when nothing has changed. That makes
+# "every write bumps it" a correctness property of the refresh, not an incidental detail.
+
+
+def test_the_revision_starts_at_a_value_that_can_be_compared(tmp_path):
+    store = ManifestStore(str(tmp_path / "manifest.db"))
+    assert isinstance(store.revision, int)
+
+
+def test_every_kind_of_write_bumps_the_revision(tmp_path):
+    store = ManifestStore(str(tmp_path / "manifest.db"))
+
+    seen = [store.revision]
+    store.record_success("fp1", "a.mp4", 1, "web_api")
+    seen.append(store.revision)
+    store.record_failure("fp2", "b.mp4", 1, "web_api", "boom")
+    seen.append(store.revision)
+    store.record_already_existed("fp3", "c.mp4", 1, "web_api", pending_review=True)
+    seen.append(store.revision)
+    store.clear_pending_review("fp3")
+    seen.append(store.revision)
+
+    assert seen == sorted(seen) and len(set(seen)) == len(seen)
+
+
+def test_reading_does_not_bump_the_revision(tmp_path):
+    """Otherwise the window would rebuild on every tick regardless - the check would be reading
+    its own writes."""
+    store = ManifestStore(str(tmp_path / "manifest.db"))
+    store.record_success("fp1", "a.mp4", 1, "web_api")
+
+    before = store.revision
+    store.get_recent(10)
+    store.get_stats()
+    store.get_pending_review()
+    store.is_already_handled("fp1")
+
+    assert store.revision == before
+
+
+def test_stats_count_each_status_separately(tmp_path):
+    store = ManifestStore(str(tmp_path / "manifest.db"))
+    store.record_success("fp1", "a.mp4", 100, "web_api")
+    store.record_success("fp2", "b.mp4", 200, "web_api")
+    store.record_failure("fp3", "c.mp4", 300, "web_api", "boom")
+    store.record_already_existed("fp4", "d.mp4", 400, "web_api", pending_review=True)
+
+    stats = store.get_stats()
+    assert (stats.uploaded, stats.failed, stats.already_on_server) == (2, 1, 1)
+    assert stats.pending_review == 1
+    assert stats.total == 4
+
+
+def test_bytes_uploaded_counts_only_what_was_actually_transferred(tmp_path):
+    """A file matched to one already on the server was never sent. Counting it would inflate a
+    number the user reads as "how much of my upstream this has spent"."""
+    store = ManifestStore(str(tmp_path / "manifest.db"))
+    store.record_success("fp1", "a.mp4", 100, "web_api")
+    store.record_already_existed("fp2", "b.mp4", 999_999, "web_api")
+    store.record_failure("fp3", "c.mp4", 555_555, "web_api", "boom")
+
+    assert store.get_stats().bytes_uploaded == 100
+
+
+def test_stats_on_an_empty_manifest_are_zeroes_not_an_error(tmp_path):
+    stats = ManifestStore(str(tmp_path / "manifest.db")).get_stats()
+    assert (stats.uploaded, stats.failed, stats.already_on_server, stats.bytes_uploaded) == (0, 0, 0, 0)

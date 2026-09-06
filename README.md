@@ -6,7 +6,10 @@ instance.
 
 ## Features
 
-- Runs quietly in the system tray - no window on launch, configurable from a Settings dialog.
+- Runs quietly in the system tray - no window on launch. Left-click the tray icon to open the
+  main window, which shows what's uploading right now (with a live progress bar, transfer
+  rate and ETA), what's already been uploaded, anything waiting on a decision from you, and
+  buttons for Sync Now, Pause, Settings and Exit.
 - Watches one or more folders for new clips/screenshots and waits until a file is fully written
   (stable size + an exclusive-open probe) before touching it, so in-progress recordings are never
   copied mid-write. A file that's still growing (e.g. a long manual "Record" session, not just a
@@ -22,8 +25,15 @@ instance.
   anything new it also checks whether a same-named file already exists on the Fireshare server -
   so a lost/reinstalled local database, or a clip already uploaded some other way, doesn't result
   in a duplicate.
+- Copy the Fireshare share link for anything you've uploaded, straight from the main window -
+  the point of recording a clip is usually to send it to someone.
 - After a successful upload, choose to leave the file in place, move it to a subfolder, or delete
-  it.
+  it. If a file was matched to one already on the server by filename alone, nothing is moved or
+  deleted automatically - it's parked in the main window's **Needs review** list for you to decide
+  per file.
+- The activity list refreshes itself while the window is open, can be filtered (All / Uploaded /
+  Needs review / Failed) and searched by name or folder, and says "No files left to upload" once
+  the queue is clear.
 - Your Fireshare password is stored in Windows Credential Manager, never in the config file.
 - Checks GitHub Releases for a newer version on startup (configurable) and lets you update from
   the tray menu with one click - see [Updating](#updating) below.
@@ -55,9 +65,48 @@ icon and choose **Open Settings**:
   **Test Connection** to confirm it works before saving.
 - **Advanced** tab: startup, notification, and update-check preferences.
 
-Click **Save** and the agent starts watching immediately - no restart needed. Right-click the tray
-icon any time to check upload status (**View Activity / Log**), trigger an immediate scan
-(**Sync Now**), or pause watching.
+Click **Save** and the agent starts watching immediately - no restart needed.
+
+## The main window
+
+Left-click the tray icon (or right-click > **Open Fireshare Agent**) to open it. It has four
+parts:
+
+- **Status** - what the agent is doing right now: the file being uploaded with a progress bar,
+  how much has transferred, the current rate and an estimated time remaining, plus how many files
+  are queued behind it. When there's nothing to do it says so: *No files left to upload*.
+- **Needs review** - files matched to something already on Fireshare by filename only. That match
+  can't be verified exactly (Fireshare exposes neither a size nor a content hash for existing
+  files), so the agent won't move or delete your local copy on its own. Choose **Keep**, **Move**
+  or **Delete** per file. This section is hidden when the list is empty.
+- **Activity** - everything the agent has recorded, newest first, with local timestamps. It
+  refreshes on its own while the window is open, and you can filter it (All / Uploaded / Needs
+  review / Failed) or search by filename or folder. Click a row to select it, then **Copy Link**
+  to put its Fireshare share link on your clipboard (or double-click the row, or right-click it
+  for the same options plus **Copy File Path**).
+- **Buttons** - **Sync Now** (rescan every watch folder immediately), **Pause** / **Resume**,
+  **Settings**, and **Exit Agent** (stops the agent completely).
+
+Closing the window with the X just hides it - the agent keeps watching in the background. Only
+**Exit Agent**, or **Exit** in the tray menu, actually stops it.
+
+Hovering the tray icon shows the same status in short form, so you can check on a long upload
+without opening anything: *Fireshare Agent - uploading clip.mp4 (43%)*.
+
+### Copying a share link
+
+Select an uploaded row in **Activity** and click **Copy Link**. The agent looks the file up on
+your Fireshare server and copies its public link (`.../w/<id>` for a video, `.../i/<id>` for an
+image), respecting the **Shareable Link Domain** setting if your Fireshare admin has configured
+one. The link is remembered afterwards, so copying it again is instant.
+
+Fireshare's upload API doesn't hand back a link when an upload finishes - the server processes the
+file in the background and creates its entry a moment later. So a link asked for within a few
+seconds of a large upload can briefly be unavailable, and the agent says so
+(*"Fireshare hasn't finished processing X yet - try again in a moment"*) rather than reporting a
+failure. Wait a moment and click again.
+
+Failed uploads have no link, so **Copy Link** is disabled for them.
 
 ## Updating
 
