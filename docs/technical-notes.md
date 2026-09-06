@@ -104,6 +104,28 @@ layers of duplicate protection for the media type that matters most here. Both l
 `sort=updated_at desc`, which is on both allowlists. This has been the server's behaviour since at
 least Fireshare v1.6.16, so it was never working, rather than having regressed.
 
+### Extensions come back with the dot
+
+Both listings return `extension` as `".mp4"` / `".png"`, dot included. `_find_existing_entry()`
+used to build its own side from `Path.suffix` with the dot stripped, so `".mp4" != "mp4"` rejected
+every candidate row and the lookup returned `None` for files that were plainly on the server.
+
+That is one comparison breaking two features, because both callers of `_find_existing_entry()`
+read a `None`/no-match as an answer rather than as a failure: `resolve_share_url()` reported
+"Fireshare hasn't finished processing this yet" *forever* for an already-uploaded clip, and
+`exists_at_destination()` reported "not a duplicate, upload anyway" for everything - killing the
+server-side duplicate check a second time, by a cause entirely independent of the sort parameter
+above. The sort fix got the request through; this rejected the response.
+
+Both sides now go through `_normalize_extension()` (strip whitespace, strip a leading dot,
+lowercase), rather than the local side simply learning to keep its dot - neither spelling can
+reintroduce the bug that way if the server's shape changes again.
+
+Worth knowing when writing tests here: every fixture in the suite used to spell the extension
+without a dot, which is not what a Fireshare returns. Code and tests agreed on the same wrong
+assumption, which is exactly why a well-covered path stayed broken. **Fixture rows for
+`/api/videos` and `/api/images` must carry the dot.**
+
 ## Self-updater
 
 `fireshare_agent/updater.py` checks GitHub Releases for the repo's latest release and, once the

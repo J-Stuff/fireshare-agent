@@ -233,7 +233,7 @@ def test_exists_at_destination_matches_by_filename_and_extension(preserve_web_ap
     delete_secret(WEB_API_SESSION_COOKIES)
     uploader = WebApiUploader(_settings())
     login_response = _mock_response({})
-    videos_response = _mock_response({"videos": [{"path": "Uploaded/my_clip.mp4", "extension": "mp4"}]})
+    videos_response = _mock_response({"videos": [{"path": "Uploaded/my_clip.mp4", "extension": ".mp4"}]})
 
     with patch.object(uploader._session, "post", return_value=login_response):
         with patch.object(uploader._session, "get", return_value=videos_response):
@@ -246,7 +246,7 @@ def test_exists_at_destination_returns_false_when_no_match(preserve_web_api_sess
     delete_secret(WEB_API_SESSION_COOKIES)
     uploader = WebApiUploader(_settings())
     login_response = _mock_response({})
-    videos_response = _mock_response({"videos": [{"path": "Uploaded/some_other_clip.mp4", "extension": "mp4"}]})
+    videos_response = _mock_response({"videos": [{"path": "Uploaded/some_other_clip.mp4", "extension": ".mp4"}]})
 
     with patch.object(uploader._session, "post", return_value=login_response):
         with patch.object(uploader._session, "get", return_value=videos_response):
@@ -325,7 +325,7 @@ def test_upload_invalidates_the_existing_entries_cache(tmp_path, preserve_web_ap
     path.write_bytes(b"x" * 10)
 
     uploader = WebApiUploader(_settings())
-    uploader._existing_entries_cache[MediaKind.VIDEO] = (0.0, [{"path": "old.mp4", "extension": "mp4"}])
+    uploader._existing_entries_cache[MediaKind.VIDEO] = (0.0, [{"path": "old.mp4", "extension": ".mp4"}])
 
     post_response = _mock_response({})
     post_response.status_code = 201
@@ -412,7 +412,7 @@ def test_exists_at_destination_treats_same_name_in_a_different_folder_as_distinc
 
     login_response = _mock_response({})
     # Same filename already exists, but under a different game's folder.
-    videos_response = _mock_response({"videos": [{"path": "OtherGame/clip.mp4", "extension": "mp4"}]})
+    videos_response = _mock_response({"videos": [{"path": "OtherGame/clip.mp4", "extension": ".mp4"}]})
 
     file = PendingFile(path=r"C:\Clips\clip.mp4", kind=MediaKind.VIDEO, size_bytes=1, remote_folder_hint="SomeGame")
 
@@ -430,7 +430,7 @@ def test_exists_at_destination_matches_same_name_in_the_same_folder(preserve_web
     uploader = WebApiUploader(settings)
 
     login_response = _mock_response({})
-    videos_response = _mock_response({"videos": [{"path": "SomeGame/clip.mp4", "extension": "mp4"}]})
+    videos_response = _mock_response({"videos": [{"path": "SomeGame/clip.mp4", "extension": ".mp4"}]})
 
     file = PendingFile(path=r"C:\Clips\clip.mp4", kind=MediaKind.VIDEO, size_bytes=1, remote_folder_hint="SomeGame")
 

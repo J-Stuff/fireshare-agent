@@ -55,7 +55,11 @@ def _uploader(entries=None, kind_key="videos", config_body=None) -> WebApiUpload
     return uploader
 
 
-def _video(path, video_id, extension="mp4"):
+def _video(path, video_id, extension=".mp4"):
+    """Note the dot. Both listing endpoints return `extension` with its leading dot, and every
+    fixture here used to spell it without one - which is precisely why the comparison bug in
+    _find_existing_entry (see test_an_extension_matches_with_or_without_its_leading_dot) survived
+    a suite that otherwise covered this code path thoroughly."""
     return {"video_id": video_id, "path": path, "extension": extension}
 
 
@@ -85,6 +89,39 @@ def test_the_image_listing_sends_the_same_sort():
     assert kwargs["params"]["sort"] == "updated_at desc"
 
 
+# ------------------------------------------------------------------ the extension-match bug
+
+@pytest.mark.parametrize("server_extension", [".mp4", "mp4", ".MP4"])
+def test_an_extension_matches_with_or_without_its_leading_dot(server_extension):
+    """Regression test for the second silently broken duplicate check.
+
+    A real Fireshare returns `extension` as ".mp4"; the local side derived its value from
+    Path.suffix and stripped the dot, so the guard in `_find_existing_entry` compared ".mp4"
+    against "mp4", rejected every candidate row, and reported the file as absent. That made Copy
+    Link and Open in Fireshare say "Fireshare hasn't finished processing ... yet" forever for
+    files that had uploaded fine, and made `exists_at_destination` answer False for everything -
+    the same failure shape as the missing `sort` parameter above, and equally invisible."""
+    uploader = _uploader(entries=[_video("Desktop/clip.mp4", "abc123", extension=server_extension)])
+    file = PendingFile(
+        path=r"C:\clips\Desktop\clip.mp4", kind=MediaKind.VIDEO, size_bytes=10,
+        remote_folder_hint="Desktop",
+    )
+
+    assert uploader.resolve_share_url(file) == "https://fireshare.example.com/w/abc123"
+
+
+def test_a_genuinely_different_extension_still_does_not_match():
+    """The dot is noise; the extension itself is not. A .mp4 and a .mkv of the same name are two
+    files, and normalizing the comparison must not blur that."""
+    uploader = _uploader(entries=[_video("Desktop/clip.mkv", "abc123", extension=".mkv")])
+    file = PendingFile(
+        path=r"C:\clips\Desktop\clip.mp4", kind=MediaKind.VIDEO, size_bytes=10,
+        remote_folder_hint="Desktop",
+    )
+
+    assert uploader.resolve_share_url(file) is None
+
+
 # ------------------------------------------------------------------ URL construction
 
 def test_a_video_link_uses_the_watch_path():
@@ -99,7 +136,7 @@ def test_a_video_link_uses_the_watch_path():
 
 
 def test_an_image_link_uses_the_image_path():
-    uploader = _uploader(entries=[{"image_id": "img789", "path": "shot.png", "extension": "png"}], kind_key="images")
+    uploader = _uploader(entries=[{"image_id": "img789", "path": "shot.png", "extension": ".png"}], kind_key="images")
     file = PendingFile(path=r"C:\clips\shot.png", kind=MediaKind.IMAGE, size_bytes=10)
 
     assert uploader.resolve_share_url(file) == "https://fireshare.example.com/i/img789"
@@ -123,7 +160,7 @@ def test_a_file_the_server_does_not_know_about_yet_has_no_link():
 
 
 def test_a_row_without_an_id_yields_no_link_rather_than_a_broken_one():
-    uploader = _uploader(entries=[{"path": "clip.mp4", "extension": "mp4"}])
+    uploader = _uploader(entries=[{"path": "clip.mp4", "extension": ".mp4"}])
     file = PendingFile(path=r"C:\clips\clip.mp4", kind=MediaKind.VIDEO, size_bytes=10)
 
     assert uploader.resolve_share_url(file) is None
