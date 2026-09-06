@@ -401,7 +401,7 @@ class WebApiUploader(Uploader):
         entries = self._fetch_existing_entries(file.kind, force_refresh=force_refresh)
 
         target_stem = _normalize_filename(Path(file.path).name)
-        target_ext = Path(file.path).suffix.lstrip(".").lower()
+        target_ext = _normalize_extension(Path(file.path).suffix)
         # Folder-aware now that folders carry real meaning (mirrored per-game subfolders): two
         # different games' clips can legitimately share a filename, so a folder mismatch means
         # "different file", not "already uploaded". Only enforced when we actually know which
@@ -413,7 +413,7 @@ class WebApiUploader(Uploader):
             stored_path = entry.get("path") or ""
             if not stored_path:
                 continue
-            stored_ext = (entry.get("extension") or "").lower()
+            stored_ext = _normalize_extension(entry.get("extension"))
             stored_path_obj = Path(stored_path)
 
             if _normalize_filename(stored_path_obj.name) != target_stem:
@@ -522,6 +522,24 @@ def _normalize_filename(name: str) -> str:
     letters/digits removed. Not trying to replicate Werkzeug's secure_filename exactly - just
     needs to treat "My Clip.mp4" and "my_clip.mp4" as the same file for dedupe purposes."""
     return re.sub(r"[^a-z0-9]+", "", Path(name).stem.lower())
+
+
+def _normalize_extension(value: str | None) -> str:
+    """Comparison key for a file extension, tolerant of the leading dot being there or not.
+
+    Both /api/videos and /api/images return `extension` *with* the dot (".mp4"), while the local
+    side derived its value from Path.suffix and stripped the dot - so ".mp4" != "mp4" made every
+    candidate row fail the extension check and _find_existing_entry returned None for files that
+    were plainly sitting on the server. That silently broke two separate features at once: Copy
+    Link / Open in Fireshare answered "Fireshare hasn't finished processing ... yet" forever for
+    a clip that had uploaded fine, and exists_at_destination reported False for everything,
+    disabling server-side dedupe exactly the way the missing `sort` parameter once did. Every fixture in the test suite
+    happened to spell the extension without a dot, so nothing caught it.
+
+    Normalizing both sides rather than adding a dot to the local one is deliberate: it costs
+    nothing and neither spelling can reintroduce the bug if the server's shape ever changes.
+    """
+    return (value or "").strip().lstrip(".").lower()
 
 
 def _safe_progress(on_progress: ProgressCallback | None) -> ProgressCallback:
