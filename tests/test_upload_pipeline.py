@@ -283,11 +283,7 @@ class _AlreadyThereUploader:
     def exists_at_destination(self, file) -> bool:
         return True
 
-<<<<<<< HEAD
     def upload(self, file, on_progress=None) -> UploadResult:  # pragma: no cover - must never be reached
-=======
-    def upload(self, file) -> UploadResult:  # pragma: no cover - must never be reached
->>>>>>> origin/main
         raise AssertionError("upload() must not be called for a file already at the destination")
 
 

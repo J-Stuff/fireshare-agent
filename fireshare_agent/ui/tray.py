@@ -57,10 +57,7 @@ class TrayIcon:
         update_version: Callable[[], str] = lambda: "",
         on_update_now: Callable[[], None] = lambda: None,
         pending_review_count: Callable[[], int] = lambda: 0,
-<<<<<<< HEAD
         tooltip: Callable[[], str] | None = None,
-=======
->>>>>>> origin/main
     ) -> None:
         # Falls back to the plain paused/not-paused text when no richer source is supplied, so a
         # caller that does not care about live progress gets the old behaviour.
@@ -87,7 +84,6 @@ class TrayIcon:
                 ),
                 pystray.MenuItem(
                     lambda item: f"Review {self._pending_review_count()} File(s)...",
-<<<<<<< HEAD
                     lambda: on_open_main_window(),
                     visible=lambda item: self._pending_review_count() > 0,
                 ),
@@ -99,11 +95,6 @@ class TrayIcon:
                 pystray.MenuItem(
                     "Open Fireshare Agent", lambda: on_open_main_window(), default=True,
                 ),
-=======
-                    lambda: on_open_activity(),
-                    visible=lambda item: self._pending_review_count() > 0,
-                ),
->>>>>>> origin/main
                 pystray.MenuItem("Open Settings", lambda: on_open_settings()),
                 pystray.MenuItem("Sync Now", lambda: on_sync_now()),
                 pystray.MenuItem(
@@ -116,12 +107,9 @@ class TrayIcon:
         )
 
     def _title(self) -> str:
-<<<<<<< HEAD
         return self._tooltip()
 
     def _default_title(self) -> str:
-=======
->>>>>>> origin/main
         return "Fireshare Agent (paused)" if self._is_paused() else "Fireshare Agent"
 
     def refresh(self) -> None:

@@ -101,11 +101,7 @@ class FireshareAgentApp:
 
         self.tray = TrayIcon(
             on_open_settings=lambda: self.run_on_ui_thread(self.open_settings),
-<<<<<<< HEAD
             on_open_main_window=lambda: self.run_on_ui_thread(self.open_main_window),
-=======
-            on_open_activity=lambda: self.run_on_ui_thread(self.open_activity),
->>>>>>> origin/main
             on_sync_now=self._start_sync,
             on_toggle_pause=self._toggle_pause,
             is_paused=lambda: self.pipeline.is_paused,
@@ -115,12 +111,9 @@ class FireshareAgentApp:
             update_version=lambda: self._update_info.version if self._update_info else "",
             on_update_now=lambda: self.run_on_ui_thread(self.confirm_and_apply_update),
             pending_review_count=lambda: self.pipeline.pending_review_count,
-<<<<<<< HEAD
             # Read on every hover and on every progress tick, so it has to be a live callback
             # rather than a string computed once at construction.
             tooltip=lambda: formatting.tray_tooltip(self.pipeline.get_status()),
-=======
->>>>>>> origin/main
         )
         tray_thread = threading.Thread(target=self.tray.run, daemon=True, name="fireshare-agent-tray")
         tray_thread.start()
@@ -185,7 +178,6 @@ class FireshareAgentApp:
         if self.main_window is not None and self.main_window.winfo_exists():
             self.main_window.show()
             return
-<<<<<<< HEAD
 
         self.main_window = MainWindow(
             self.root, self.manifest, self.pipeline,
@@ -199,9 +191,6 @@ class FireshareAgentApp:
             update_version=lambda: self._update_info.version if self._update_info else "",
             on_update_now=self.confirm_and_apply_update,
         )
-=======
-        self.activity_window = ActivityWindow(self.root, self.manifest, self.pipeline)
->>>>>>> origin/main
 
     def _on_settings_saved(self, new_config: AppConfig) -> None:
         self.config = new_config
@@ -212,10 +201,7 @@ class FireshareAgentApp:
         # so the tray can never keep asserting a state the pipeline has moved on from.
         if self.tray:
             self.tray.refresh()
-<<<<<<< HEAD
         self._refresh_main_window()
-=======
->>>>>>> origin/main
         log.info("Settings saved; watcher and uploader reconfigured.")
 
     def _toggle_pause(self) -> None:
@@ -306,7 +292,6 @@ class FireshareAgentApp:
     def _on_activity(self, activity: PipelineActivity) -> None:
         log.log(*_log_line_for(activity))
 
-<<<<<<< HEAD
         if activity.event_kind == PipelineEventKind.PROGRESS:
             # Only the hover text moves during a transfer. Going through the full tray refresh
             # here would rebuild the icon bitmap and the native menu roughly once a second for
@@ -324,11 +309,6 @@ class FireshareAgentApp:
         ):
             # These move the failure badge and the "Review N File(s)" menu entry, so the icon and
             # the menu both have to be rebuilt.
-=======
-        if self.tray and activity.event_kind in (
-            PipelineEventKind.SUCCEEDED, PipelineEventKind.FAILED, PipelineEventKind.ALREADY_AT_DESTINATION,
-        ):
->>>>>>> origin/main
             self.run_on_ui_thread(self.tray.refresh)
 
         if activity.event_kind == PipelineEventKind.IDLE:
@@ -339,13 +319,8 @@ class FireshareAgentApp:
                 self._notify(f"Uploaded {_short_name(activity.path)}")
             elif activity.event_kind == PipelineEventKind.ALREADY_AT_DESTINATION:
                 self._notify(
-<<<<<<< HEAD
                     f"Already on Fireshare: {_short_name(activity.path)} - open Fireshare Agent "
                     "to choose what happens to the local copy."
-=======
-                    f"Already on Fireshare: {_short_name(activity.path)} - open the tray menu to "
-                    "review what happens to the local copy."
->>>>>>> origin/main
                 )
             elif activity.event_kind == PipelineEventKind.FAILED:
                 self._notify(f"Failed to upload {_short_name(activity.path)}: {activity.message}")

@@ -598,7 +598,6 @@ def test_a_persisted_session_round_trips(preserve_web_api_session_secret):
     assert {(c.name, c.value, c.domain, c.path) for c in loader._session.cookies} == {
         (c.name, c.value, c.domain, c.path) for c in saver._session.cookies
     }
-<<<<<<< HEAD
 
 
 # --------------------------------------------------------------------- upload progress reporting
@@ -689,5 +688,3 @@ def test_progress_is_optional(tmp_path):
 
     with patch.object(uploader, "_post_chunk"):
         uploader._upload_video_chunked(file)  # must not raise
-=======
->>>>>>> origin/main

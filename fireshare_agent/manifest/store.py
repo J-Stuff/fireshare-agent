@@ -52,7 +52,6 @@ CREATE TABLE IF NOT EXISTS agent_state (
 # without a schema change.
 _STATE_WATCHING_PAUSED = "watching_paused"
 
-<<<<<<< HEAD
 
 @dataclass(frozen=True)
 class ManifestStats:
@@ -70,8 +69,6 @@ class ManifestStats:
     def total(self) -> int:
         return self.uploaded + self.already_on_server + self.failed
 
-=======
->>>>>>> origin/main
 
 @dataclass(frozen=True)
 class ManifestEntry:
@@ -83,14 +80,11 @@ class ManifestEntry:
     status: str
     error: str | None
     pending_review: bool = False
-<<<<<<< HEAD
     # The public Fireshare link, once it has been resolved. None means "not looked up yet" - not
     # "there is no link" - because the id only exists after the server finishes processing the
     # upload, so a row can legitimately sit here without one for a while. Cached rather than
     # re-derived on every click: resolving costs a request that lists every video on the server.
     share_url: str | None = None
-=======
->>>>>>> origin/main
 
 
 class ManifestStore:
@@ -148,13 +142,10 @@ class ManifestStore:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(uploads)")}
         if "pending_review" not in columns:
             conn.execute("ALTER TABLE uploads ADD COLUMN pending_review INTEGER NOT NULL DEFAULT 0")
-<<<<<<< HEAD
         if "share_url" not in columns:
             # Nullable with no default: NULL is meaningful here (never resolved), and is what
             # every pre-existing row correctly starts as.
             conn.execute("ALTER TABLE uploads ADD COLUMN share_url TEXT")
-=======
->>>>>>> origin/main
 
     def is_already_handled(self, fingerprint: str) -> bool:
         with self._connection() as conn:
@@ -225,7 +216,6 @@ class ManifestStore:
         waiting longest belongs at the top."""
         return self._select("WHERE pending_review = 1 ORDER BY updated_at_utc ASC", ())
 
-<<<<<<< HEAD
     def set_share_url(self, fingerprint: str, share_url: str) -> None:
         """Caches a resolved Fireshare link against its upload row.
 
@@ -236,14 +226,11 @@ class ManifestStore:
             conn.execute("UPDATE uploads SET share_url = ? WHERE fingerprint = ?", (share_url, fingerprint))
         self._bump_revision()
 
-=======
->>>>>>> origin/main
     def clear_pending_review(self, fingerprint: str) -> None:
         """Records that the user has decided. The row itself stays - it is still the dedupe
         record that stops this file being uploaded again."""
         with self._connection() as conn:
             conn.execute("UPDATE uploads SET pending_review = 0 WHERE fingerprint = ?", (fingerprint,))
-<<<<<<< HEAD
         self._bump_revision()
 
     def get_stats(self) -> ManifestStats:
@@ -302,42 +289,6 @@ class ManifestStore:
                 SELECT fingerprint, path, size_bytes, updated_at_utc, method, status, error, pending_review, share_url
                 FROM uploads {clause}
                 """,
-=======
-
-    def is_watching_paused(self) -> bool:
-        """Whether the user left the agent paused. Read once at startup to restore the pause
-        across restarts; defaults to False for a database written before this table existed."""
-        return self._get_flag(_STATE_WATCHING_PAUSED, default=False)
-
-    def set_watching_paused(self, paused: bool) -> None:
-        self._set_flag(_STATE_WATCHING_PAUSED, paused)
-
-    def _get_flag(self, key: str, default: bool) -> bool:
-        with self._connection() as conn:
-            row = conn.execute("SELECT value FROM agent_state WHERE key = ?", (key,)).fetchone()
-        return default if row is None else row[0] == "1"
-
-    def _set_flag(self, key: str, value: bool) -> None:
-        with self._connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO agent_state (key, value) VALUES (?, ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                """,
-                (key, "1" if value else "0"),
-            )
-
-    def get_recent(self, limit: int = 100) -> list[ManifestEntry]:
-        return self._select("ORDER BY updated_at_utc DESC LIMIT ?", (limit,))
-
-    def _select(self, clause: str, params: tuple) -> list[ManifestEntry]:
-        with self._connection() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT fingerprint, path, size_bytes, updated_at_utc, method, status, error, pending_review
-                FROM uploads {clause}
-                """,
->>>>>>> origin/main
                 params,
             ).fetchall()
 
@@ -351,10 +302,7 @@ class ManifestStore:
                 status=r[5],
                 error=r[6],
                 pending_review=bool(r[7]),
-<<<<<<< HEAD
                 share_url=r[8],
-=======
->>>>>>> origin/main
             )
             for r in rows
         ]
