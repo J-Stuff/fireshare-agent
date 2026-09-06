@@ -2,6 +2,24 @@
 
 <!-- version list -->
 
+## v1.5.0 (2026-09-06)
+
+### Chores
+
+- Update .gitignore to add local development files
+  ([`70b37a0`](https://github.com/J-Stuff/fireshare-agent/commit/70b37a0a4cc9cbc85d6cb39d1e70f1c0d78230ed))
+
+### Documentation
+
+- Replace the dev-branch/squash workflow with short-lived branches
+  ([`395265d`](https://github.com/J-Stuff/fireshare-agent/commit/395265d7e2caad73bba28e8ee1c3e6d2597dfa6d))
+
+### Features
+
+- Added customisable upload speed limit
+  ([`287cfaa`](https://github.com/J-Stuff/fireshare-agent/commit/287cfaa534538f332b95b9f2fd83de6e20094fb5))
+
+
 ## v1.4.0 (2026-09-06)
 
 ### Bug Fixes
