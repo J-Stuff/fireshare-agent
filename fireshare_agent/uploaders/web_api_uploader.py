@@ -44,8 +44,11 @@ from fireshare_agent.uploaders.base import ProgressCallback, Uploader
 
 log = logging.getLogger(__name__)
 
+log = logging.getLogger(__name__)
+
 _EXISTING_ENTRIES_CACHE_TTL_SECONDS = 60
 
+<<<<<<< HEAD
 # `/api/videos` reads its sort with `request.args.get('sort')` - no default - and 400s on anything
 # outside its allowlist. Omitting it (as this uploader used to) meant every video duplicate check
 # got a 400, which raise_for_status turned into an exception that exists_at_destination swallowed
@@ -65,6 +68,8 @@ _ID_FIELD = {MediaKind.VIDEO: "video_id", MediaKind.IMAGE: "image_id"}
 # point of copying one.
 _CONFIG_CACHE_TTL_SECONDS = 300
 
+=======
+>>>>>>> origin/main
 # Bumped whenever the persisted-session envelope changes shape. v1 stored a flat {name: value}
 # map, which lost every cookie attribute; anything that isn't the current version is discarded and
 # re-earned by a fresh login rather than reinterpreted under new rules.

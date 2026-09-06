@@ -154,6 +154,7 @@ def test_agent_state_table_is_created_in_a_database_that_predates_it(tmp_path):
     store.set_watching_paused(True)
     assert store.is_watching_paused() is True
     assert store.is_already_handled("fp1") is True  # upgrade did not disturb existing history
+<<<<<<< HEAD
 
 
 # --------------------------------------------------------------------------- revision & stats
@@ -227,3 +228,5 @@ def test_bytes_uploaded_counts_only_what_was_actually_transferred(tmp_path):
 def test_stats_on_an_empty_manifest_are_zeroes_not_an_error(tmp_path):
     stats = ManifestStore(str(tmp_path / "manifest.db")).get_stats()
     assert (stats.uploaded, stats.failed, stats.already_on_server, stats.bytes_uploaded) == (0, 0, 0, 0)
+=======
+>>>>>>> origin/main

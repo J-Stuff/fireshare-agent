@@ -11,7 +11,10 @@ event loop and frozen the settings and activity windows instead.
 Also covers the update-check response, reported by J: "Check for Updates Now" looked like it did
 nothing whenever an update was actually available.
 """
+<<<<<<< HEAD
 import logging
+=======
+>>>>>>> origin/main
 import threading
 
 import pytest
@@ -24,8 +27,11 @@ from fireshare_agent.app import (
     decide_update_check_response,
 )
 from fireshare_agent.config.app_config import AppConfig
+<<<<<<< HEAD
 from fireshare_agent.models import MediaKind
 from fireshare_agent.pipeline.activity import PipelineActivity, PipelineEventKind
+=======
+>>>>>>> origin/main
 
 
 class _FakeRoot:
@@ -369,6 +375,7 @@ def test_an_automatic_check_never_opens_a_dialog(monkeypatch):
     assert instance.info_dialogs == []
     assert len(instance.notifications) == 1
     assert "9.9.9" in instance.notifications[0]
+<<<<<<< HEAD
 
 
 # ------------------------------------------------------------------------ activity log levels
@@ -423,3 +430,5 @@ def test_an_idle_line_does_not_print_a_stray_empty_path():
         )
     )
     assert (fmt % tuple(args)) == "idle (No files left to upload)"
+=======
+>>>>>>> origin/main

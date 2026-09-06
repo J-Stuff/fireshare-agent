@@ -95,6 +95,30 @@ class ReviewOutcome:
         return ReviewOutcome(False, message)
 
 
+_REVIEW_ACTION_VERB = {
+    PostUploadAction.LEAVE: "keep",
+    PostUploadAction.MOVE_TO_SUBFOLDER: "move",
+    PostUploadAction.DELETE: "delete",
+}
+
+
+@dataclass(frozen=True)
+class ReviewOutcome:
+    """What actually happened when the user's decision about a reviewed file was carried out.
+    `resolved` means the row should stop appearing in the review list; a failure that the user
+    could retry (a locked file, say) should leave it unresolved so the entry stays put."""
+    resolved: bool
+    message: str
+
+    @staticmethod
+    def done(message: str) -> "ReviewOutcome":
+        return ReviewOutcome(True, message)
+
+    @staticmethod
+    def failed(message: str) -> "ReviewOutcome":
+        return ReviewOutcome(False, message)
+
+
 class UploadPipeline:
     def __init__(
         self,
@@ -204,6 +228,7 @@ class UploadPipeline:
             return f"{name} deleted."
         return f"{name} kept in place."
 
+<<<<<<< HEAD
     def get_status(self) -> PipelineStatus:
         """A consistent snapshot of what the pipeline is doing, cheap enough to poll at 1 Hz.
 
@@ -342,6 +367,8 @@ class UploadPipeline:
             log.debug("Could not cache the resolved share link.", exc_info=True)
         return ShareLinkOutcome.found(url)
 
+=======
+>>>>>>> origin/main
     def start(self) -> None:
         self._stop_event.clear()
         self._watcher.start(
@@ -403,6 +430,7 @@ class UploadPipeline:
         still be part-way through a large library when the user hits Exit. It bails out on the stop
         event rather than churning the disk enqueueing work that the now-stopped worker will never
         pick up."""
+<<<<<<< HEAD
         with self._status_lock:
             self._scanning = True
             # A scan that turns up nothing still owes the user the "nothing left to upload"
@@ -417,6 +445,8 @@ class UploadPipeline:
         self._announce_idle_if_drained()
 
     def _walk_watch_folders(self) -> None:
+=======
+>>>>>>> origin/main
         for folder in self._config.watch_folders:
             if self._stop_event.is_set():
                 return
