@@ -6,6 +6,9 @@ from fireshare_agent.config.app_config import (
     MAX_RETRY_ATTEMPTS_MIN,
     RETRY_BACKOFF_MAX_SECONDS,
     RETRY_BACKOFF_MIN_SECONDS,
+    UPLOAD_SPEED_LIMIT_KBPS_MAX,
+    UPLOAD_SPEED_LIMIT_KBPS_MIN,
+    UPLOAD_SPEED_LIMIT_UNLIMITED,
     AppConfig,
     WatchFolderConfig,
 )
@@ -105,3 +108,55 @@ def test_in_range_values_are_left_alone():
     assert restored.max_retry_attempts == 7
     assert restored.retry_backoff_seconds == 45
     assert restored.web_api.chunk_size_bytes == 20 * _MB
+
+
+# --- Upload speed limit ------------------------------------------------------------------------
+#
+# The only setting whose valid values have a hole in them: 0 means "no limit", and there is no
+# other way to spell that in a numeric field, so a plain two-sided clamp would turn the default
+# into the *slowest* allowed limit.
+
+
+def test_the_speed_limit_defaults_to_unlimited():
+    assert AppConfig().web_api.upload_speed_limit_kbps == UPLOAD_SPEED_LIMIT_UNLIMITED
+    assert AppConfig.from_dict({}).web_api.upload_speed_limit_kbps == UPLOAD_SPEED_LIMIT_UNLIMITED
+
+
+def test_a_config_saved_before_the_speed_limit_existed_still_loads():
+    restored = AppConfig.from_dict({"web_api": {"base_url": "https://fireshare.example.com"}})
+
+    assert restored.web_api.upload_speed_limit_kbps == UPLOAD_SPEED_LIMIT_UNLIMITED
+
+
+@pytest.mark.parametrize("raw", [0, -1, -9999])
+def test_a_nonpositive_speed_limit_means_unlimited_rather_than_the_floor(raw):
+    restored = AppConfig.from_dict({"web_api": {"upload_speed_limit_kbps": raw}})
+
+    assert restored.web_api.upload_speed_limit_kbps == UPLOAD_SPEED_LIMIT_UNLIMITED
+
+
+def test_a_pointlessly_small_speed_limit_is_raised_to_the_floor():
+    # Pacing happens between chunk requests, so a few hundred bytes a second means a 50MB chunk
+    # implies a sleep of over a day - an agent that looks permanently wedged.
+    restored = AppConfig.from_dict({"web_api": {"upload_speed_limit_kbps": 1}})
+
+    assert restored.web_api.upload_speed_limit_kbps == UPLOAD_SPEED_LIMIT_KBPS_MIN
+
+
+def test_an_absurd_speed_limit_is_capped():
+    restored = AppConfig.from_dict({"web_api": {"upload_speed_limit_kbps": 99_999_999}})
+
+    assert restored.web_api.upload_speed_limit_kbps == UPLOAD_SPEED_LIMIT_KBPS_MAX
+
+
+def test_a_non_numeric_speed_limit_falls_back_to_unlimited():
+    restored = AppConfig.from_dict({"web_api": {"upload_speed_limit_kbps": "fast"}})
+
+    assert restored.web_api.upload_speed_limit_kbps == UPLOAD_SPEED_LIMIT_UNLIMITED
+
+
+def test_an_in_range_speed_limit_survives_a_round_trip():
+    config = AppConfig()
+    config.web_api.upload_speed_limit_kbps = 2048
+
+    assert AppConfig.from_dict(config.to_dict()).web_api.upload_speed_limit_kbps == 2048

@@ -41,12 +41,16 @@ from fireshare_agent.config.app_config import WebApiSettings
 from fireshare_agent.config.secrets import WEB_API_PASSWORD, WEB_API_SESSION_COOKIES, delete_secret, get_secret, set_secret
 from fireshare_agent.models import ConnectionTestResult, MediaKind, PendingFile, UploadResult
 from fireshare_agent.uploaders.base import ProgressCallback, Uploader
+from fireshare_agent.uploaders.throttle import RateLimiter
 
 log = logging.getLogger(__name__)
 
 log = logging.getLogger(__name__)
 
 _EXISTING_ENTRIES_CACHE_TTL_SECONDS = 60
+
+# The upload speed limit is configured in KB/s; the limiter works in bytes per second.
+_KB = 1024
 
 # `/api/videos` reads its sort with `request.args.get('sort')` - no default - and 400s on anything
 # outside its allowlist. Omitting it (as this uploader used to) meant every video duplicate check
@@ -85,9 +89,19 @@ def clear_persisted_web_api_session() -> None:
 
 
 class WebApiUploader(Uploader):
-    def __init__(self, settings: WebApiSettings, mfa_code_provider: Callable[[], str | None] | None = None) -> None:
+    def __init__(
+        self,
+        settings: WebApiSettings,
+        mfa_code_provider: Callable[[], str | None] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         self._settings = settings
         self._mfa_code_provider = mfa_code_provider
+        # Paces the transfer to the configured speed limit; a limit of 0 makes every call a no-op,
+        # so the chunk loop does not need to branch on whether one is set. `sleep` is injected
+        # because the pipeline passes one that returns early on shutdown - a limiter pause at a low
+        # limit can be minutes long, and stop() only waits 5s for this thread.
+        self._throttle = RateLimiter(settings.upload_speed_limit_kbps * _KB, sleep=sleep)
         self._session = requests.Session()
         self._session.verify = not settings.ignore_certificate_errors
         if settings.ignore_certificate_errors:
@@ -284,6 +298,11 @@ class WebApiUploader(Uploader):
         with open(file.path, "rb") as f:
             for part in range(1, total_chunks + 1):  # Fireshare's chunk loop is 1-indexed
                 chunk = f.read(chunk_size)
+                # Pays off what earlier chunks still owe the speed limit before sending this one,
+                # rather than sleeping after each send: waiting first means the final chunk of a
+                # transfer never delays the success event (and the post-upload move/delete) for a
+                # file whose bytes are already on the server.
+                self._throttle.wait()
                 self._post_chunk(chunk, part, total_chunks, check_sum, file_name, file.size_bytes, folder)
                 # Counted only after the POST returns, so the number reported is bytes the server
                 # has actually accepted rather than bytes handed to requests. A retried chunk (see
@@ -291,6 +310,7 @@ class WebApiUploader(Uploader):
                 # not be counted twice either.
                 sent += len(chunk)
                 report(sent, file.size_bytes)
+                self._throttle.charge(len(chunk))
 
     def _post_chunk(self, chunk: bytes, part: int, total_chunks: int, check_sum: str, file_name: str, size_bytes: int, folder: str) -> None:
         data = {
@@ -333,6 +353,7 @@ class WebApiUploader(Uploader):
         folder = self._resolve_folder(file)
         data = {"folder": folder} if folder else {}
 
+        self._throttle.wait()
         response = self._post_image(file.path, file_name, data)
         if response.status_code == 401:
             self._authenticated = False
@@ -341,6 +362,10 @@ class WebApiUploader(Uploader):
 
         response.raise_for_status()
         report(file.size_bytes, file.size_bytes)
+        # A screenshot is one unsplittable request, so its own transfer cannot be paced - but it
+        # is still charged, so the limit holds across a batch. Someone whose watch folder fills
+        # with a few hundred screenshots at once is exactly who set a limit in the first place.
+        self._throttle.charge(file.size_bytes)
 
     def _post_image(self, path: str, file_name: str, data: dict[str, str]) -> requests.Response:
         with open(path, "rb") as f:

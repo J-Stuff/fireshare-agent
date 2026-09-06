@@ -19,6 +19,51 @@ if you're working on the code.
   Fireshare only cleans up on a successful reassembly or a server restart, otherwise leaving them
   on disk indefinitely).
 
+## Upload speed limit
+
+`uploaders/throttle.py`'s `RateLimiter` paces transfers to `WebApiSettings.upload_speed_limit_kbps`
+(KB/s, 1024-based to match `ui.formatting.format_bytes`; 0 disables it and makes every method a
+no-op, so the chunk loop never branches on whether a limit is set).
+
+**It paces between chunk requests, not within one, and that is forced rather than chosen.**
+`requests` builds a multipart body by materializing it in full - `RequestEncodingMixin._encode_files`
+calls `fp.read()` on anything file-like - and urllib3 then hands the finished body to a single
+`sendall`. There is no hook between those two points, so a file wrapper that slept as it was read
+would pace nothing: the sleeping would happen while the body was assembled in memory and the socket
+write would still go out at line speed. Finer granularity would mean either a new dependency
+(`requests_toolbelt.MultipartEncoder`) or hand-building a chunked transfer-encoding body, which
+puts Werkzeug's multipart parser and any fronting proxy at risk for a background uploader. So the
+limit is an average with a burst of one chunk, and the Settings caption says so and points at the
+chunk size field as the way to make it smoother.
+
+Deriving the chunk size from the speed limit - the obvious way to keep bursts short - is
+deliberately *not* done. `totalChunks` would then change between retry attempts of the same file,
+and Fireshare reassembles a group by concatenating `{checkSum}.part{n}` under a checksum that is
+stable per (path, size); mixed granularity within one group reassembles to garbage.
+
+The call order is **wait before, charge after**:
+
+- Charging before a send would stall the first chunk of every upload for a full chunk's worth of
+  time before a single byte moved.
+- Sleeping after the last chunk would delay the `SUCCEEDED` event, and with it the post-upload
+  move/delete, for a file whose bytes the server already has.
+
+Debt is never negative, so idle time is not banked - an agent that sat idle overnight does not open
+with a night's worth of unthrottled transfer. And `_settle()` credits elapsed time against the
+debt, so a connection already slower than the limit never sleeps at all.
+
+Images are charged but cannot be paced: a screenshot is one unsplittable request. Charging still
+holds the limit across a batch, which is the case that matters - a watch folder filling with a few
+hundred screenshots at once.
+
+`sleep` is injected into `WebApiUploader` for two reasons: tests drive it against a fake clock, and
+`UploadPipeline._interruptible_sleep` backs it with `_stop_event.wait()`. `stop()` gives the upload
+worker five seconds, and a pause at a low limit can be minutes - a plain `time.sleep` would turn
+every Exit during a throttled upload into a five-second hang.
+
+Because `PipelineStatus`'s rate and ETA are averages over wall-clock elapsed time, they include
+the throttle pauses automatically - a limited upload reports the speed it is actually achieving.
+
 ## Share links
 
 The upload endpoints return **no identifier**. Both `/api/uploadChunked` and `/api/upload/image`

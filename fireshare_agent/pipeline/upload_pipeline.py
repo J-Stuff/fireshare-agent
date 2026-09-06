@@ -693,8 +693,19 @@ class UploadPipeline:
     def _get_or_create_uploader(self) -> Uploader:
         with self._uploader_lock:
             if self._active_uploader is None:
-                self._active_uploader = WebApiUploader(self._config.web_api, self._mfa_code_provider)
+                self._active_uploader = WebApiUploader(
+                    self._config.web_api, self._mfa_code_provider, sleep=self._interruptible_sleep,
+                )
             return self._active_uploader
+
+    def _interruptible_sleep(self, seconds: float) -> None:
+        """time.sleep, except that shutting the agent down cuts it short.
+
+        The uploader uses this to pace transfers against the configured speed limit, and at a low
+        limit one pause can run to minutes. stop() only gives this worker 5 seconds to finish
+        before giving up on it, so a plain sleep would turn every Exit during a throttled upload
+        into a five-second hang. Event.wait() is a sleep that the stop event can end early."""
+        self._stop_event.wait(seconds)
 
     def _apply_post_upload_action(self, path: str) -> None:
         try:
