@@ -1,6 +1,6 @@
 [project]
 name = "fireshare-agent"
-version = "1.5.0"
+version = "1.5.1"
 description = "Windows tray app that uploads NVIDIA ShadowPlay clips & screenshots to a Fireshare instance"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }

@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.5.1 (2026-09-06)
+
+### Bug Fixes
+
+- Match server file extensions with or without the leading dot
+  ([`65224c7`](https://github.com/J-Stuff/fireshare-agent/commit/65224c760ec3b4461b73f3e81396f87c61b994cd))
+
+
 ## v1.5.0 (2026-09-06)
 
 ### Chores
