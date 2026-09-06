@@ -148,6 +148,15 @@ user confirms, hands off to the installer rather than patching files in place it
   wizard UI appears.
 - `check_for_update()` is a no-op when running from source (`sys.frozen` is unset) - there's no
   installed exe directory to update in place.
+- Staged installers are cleared at boot, not after an update. `apply_update()` downloads into
+  `%AppData%\FireshareAgent\update\<version>\`, one directory per release, and nothing removed
+  them - a user who had taken five updates was carrying five ~60MB installers indefinitely.
+  `cleanup_staged_installers()` runs first thing in `FireshareAgentApp.run()`. It cannot run at the
+  end of an update, because the installer being deleted is the process that relaunches the app; and
+  boot is the only race-free moment, since `apply_update()` is the sole writer and it exits the
+  process immediately after launching the installer. It never raises, and one failure is *expected*:
+  right after an update, Windows still holds a lock on the running installer's image file, so that
+  entry is skipped with a DEBUG line and removed by a later boot.
 
 ## Main window refresh model
 

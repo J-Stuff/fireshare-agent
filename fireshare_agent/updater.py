@@ -14,6 +14,7 @@ import hashlib
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -138,6 +139,43 @@ def apply_update(info: UpdateInfo, on_exit: Callable[[], None]) -> None:
         close_fds=True,
     )
     on_exit()
+
+
+def cleanup_staged_installers() -> int:
+    r"""Deletes installers left behind in %AppData%\FireshareAgent\update by past updates, and
+    returns how many entries were removed.
+
+    apply_update() stages each download in its own per-version directory and nothing ever removed
+    them, so a user who took five updates was left carrying five ~60MB installers forever - every
+    one of them already run and useless. Called at startup, which is the only moment this is
+    race-free: apply_update() is the only writer, it runs from a dialog the user just clicked, and
+    it exits the process as soon as the installer is launched, so nothing can be mid-download here.
+
+    Never raises. A cleanup is not worth failing a boot over, and one failure is entirely expected:
+    immediately after an update the installer that relaunched us is often still running, and Windows
+    locks a running exe's image file. That entry simply stays until the next boot removes it.
+    """
+    update_root = app_data_dir() / "update"
+    try:
+        entries = list(update_root.iterdir())
+    except OSError:
+        return 0  # no update directory yet, or unreadable - either way there is nothing to do
+
+    removed = 0
+    for entry in entries:
+        try:
+            if entry.is_dir():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+        except OSError as ex:
+            log.debug("Leaving staged update %s in place for now: %s", entry, ex)
+            continue
+        removed += 1
+
+    if removed:
+        log.info("Removed %d stale installer(s) from %s", removed, update_root)
+    return removed
 
 
 def _is_safe_path_segment(value: str) -> bool:
