@@ -2,6 +2,53 @@
 
 <!-- version list -->
 
+## v1.4.0 (2026-09-06)
+
+### Bug Fixes
+
+- Background process bugs ([#10](https://github.com/J-Stuff/fireshare-agent/pull/10),
+  [`d455bfc`](https://github.com/J-Stuff/fireshare-agent/commit/d455bfc589c3d3f2339566807637add0c14ffc39))
+
+- Bug where saving Settings silently un-pauses a paused agent
+  ([#10](https://github.com/J-Stuff/fireshare-agent/pull/10),
+  [`d455bfc`](https://github.com/J-Stuff/fireshare-agent/commit/d455bfc589c3d3f2339566807637add0c14ffc39))
+
+- Chunk size and retry backoff accept 0 and negative values
+  ([#10](https://github.com/J-Stuff/fireshare-agent/pull/10),
+  [`d455bfc`](https://github.com/J-Stuff/fireshare-agent/commit/d455bfc589c3d3f2339566807637add0c14ffc39))
+
+- Crushed files from improper merge conflict resolution
+  ([#10](https://github.com/J-Stuff/fireshare-agent/pull/10),
+  [`d455bfc`](https://github.com/J-Stuff/fireshare-agent/commit/d455bfc589c3d3f2339566807637add0c14ffc39))
+
+- Finish deletion on an inferred server-side match patch
+  ([#10](https://github.com/J-Stuff/fireshare-agent/pull/10),
+  [`d455bfc`](https://github.com/J-Stuff/fireshare-agent/commit/d455bfc589c3d3f2339566807637add0c14ffc39))
+
+- Startup rescan sleeps 3 seconds per already-uploaded file
+  ([#10](https://github.com/J-Stuff/fireshare-agent/pull/10),
+  [`d455bfc`](https://github.com/J-Stuff/fireshare-agent/commit/d455bfc589c3d3f2339566807637add0c14ffc39))
+
+- Sync Now from tray icon blocks the tray thread
+  ([#10](https://github.com/J-Stuff/fireshare-agent/pull/10),
+  [`d455bfc`](https://github.com/J-Stuff/fireshare-agent/commit/d455bfc589c3d3f2339566807637add0c14ffc39))
+
+### Features
+
+- Add CloudFlare detection when setting upload chunk size to notify user if setting is set too high
+  ([#10](https://github.com/J-Stuff/fireshare-agent/pull/10),
+  [`d455bfc`](https://github.com/J-Stuff/fireshare-agent/commit/d455bfc589c3d3f2339566807637add0c14ffc39))
+
+- Add main status window, fix duplicate upload bug, repair failed merge conflict resolution
+  ([#10](https://github.com/J-Stuff/fireshare-agent/pull/10),
+  [`d455bfc`](https://github.com/J-Stuff/fireshare-agent/commit/d455bfc589c3d3f2339566807637add0c14ffc39))
+
+- New status window for uploads and app management. fix: Background search functionality would
+  silently swallow 400 errors from the server
+  ([#10](https://github.com/J-Stuff/fireshare-agent/pull/10),
+  [`d455bfc`](https://github.com/J-Stuff/fireshare-agent/commit/d455bfc589c3d3f2339566807637add0c14ffc39))
+
+
 ## v1.3.0 (2026-09-05)
 
 ### Bug Fixes
